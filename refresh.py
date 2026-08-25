@@ -7,7 +7,7 @@
 """
 import akshare as ak
 from datetime import datetime, timedelta
-import json, time, os, io, sys, requests
+import json, time, os, io, sys, shutil, requests
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(OUT_DIR, "国家队ETF每日净买入卖出报表.html")
@@ -705,4 +705,6 @@ if __name__ == "__main__":
     with open(os.path.join(OUT_DIR, "_etf_data.json"), "w", encoding="utf-8") as f:
         json.dump(p, f, ensure_ascii=False)
     render_html(p)
+    # ASCII 文件名副本, 供外部脚本(如 Windows 计划任务)在 ANSI 编码下安全引用
+    shutil.copyfile(REPORT, os.path.join(OUT_DIR, "report_latest.html"))
     print("数据更新完成, 最新数据日:", p["data_asof"], "共", len(p["dates"]), "个交易日")
