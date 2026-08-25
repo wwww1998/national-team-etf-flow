@@ -11,6 +11,45 @@ import json, time, os, io, sys, requests
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(OUT_DIR, "国家队ETF每日净买入卖出报表.html")
+SHARES_CACHE = os.path.join(OUT_DIR, "_etf_shares_cache.json")
+
+def gen_cal_days(start_d, end_d):
+    """start_d..end_d 之间的工作日(周一~周五), 返回 YYYYMMDD 序列"""
+    out, cur = [], start_d
+    while cur <= end_d:
+        if cur.weekday() < 5:
+            out.append(cur.strftime("%Y%m%d"))
+        cur += timedelta(days=1)
+    return out
+
+def incremental_dates(cache, cal_days):
+    """增量拉取窗口: 有缓存则只拉最近若干天(含补拉最近12天以便捕获晚发布), 无缓存则全量构建"""
+    hist = (cache or {}).get("shares", {})
+    today = datetime.now()
+    if not hist:
+        return natural_dates(cal_days)
+    try:
+        lastc = datetime.strptime(max(hist), "%Y%m%d")
+    except Exception:
+        lastc = today - timedelta(days=1)
+    start = lastc + timedelta(days=1)
+    refresh = today - timedelta(days=12)
+    if start > refresh:
+        start = refresh
+    return gen_cal_days(start, today)
+
+def load_shares_cached(window_dates, cache):
+    """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start)"""
+    hist = cache.setdefault("shares", {})
+    fetched, valid_fetch, ds_start = load_shares(window_dates)
+    for d, m in fetched.items():
+        if m:
+            hist.setdefault(d, {}).update(m)
+    if ds_start:
+        cache["deep_start"] = ds_start
+    cached_days = sorted(hist.keys())
+    valid = sorted(d for d in cached_days if hist[d])
+    return hist, valid, cache.get("deep_start")
 
 TARGETS = [
     ("510300","沪深300ETF 华泰柏瑞","sh"),("510310","沪深300ETF 易方达","sh"),
@@ -202,8 +241,20 @@ def load_nav():
 
 def main():
     print("拉取数据中 ...", flush=True)
-    dates = natural_dates(CAL_DAYS)
-    shares, valid, deep_start = load_shares(dates)
+    cache = {}
+    if os.path.exists(SHARES_CACHE):
+        try:
+            with open(SHARES_CACHE, encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception as e:
+            print("缓存损坏, 将全量重建:", e, flush=True)
+            cache = {}
+    window = incremental_dates(cache, CAL_DAYS)
+    print("本次拉取日期窗口: %s ~ %s (共%d个工作日)" %
+          (window[0] if window else "-", window[-1] if window else "-", len(window)), flush=True)
+    shares, valid, deep_start = load_shares_cached(window, cache)
+    with open(SHARES_CACHE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False)
     if not valid:
         print("未取到任何交易日份额数据"); return 1
     nav = load_nav()

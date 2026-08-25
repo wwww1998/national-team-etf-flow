@@ -1,10 +1,7 @@
-name: 每日刷新国家队ETF报表
+name: 手动刷新国家队ETF报表
 
 on:
-  schedule:
-    # 每个工作日 20:00(UTC+8=12:00 UTC) 收盘后运行; 周末不触发
-    - cron: "0 12 * * 1-5"
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 permissions:
   contents: write
