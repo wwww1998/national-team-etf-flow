@@ -46,7 +46,9 @@ def load_shares_cached(window_dates, cache):
         if m:
             hist.setdefault(d, {}).update(m)
     if ds_start:
-        cache["deep_start"] = ds_start
+        cached_ds = cache.get("deep_start")
+        if not cached_ds or str(ds_start) < str(cached_ds):
+            cache["deep_start"] = ds_start
     cached_days = sorted(hist.keys())
     valid = sorted(d for d in cached_days if hist[d])
     return hist, valid, cache.get("deep_start")
@@ -244,7 +246,7 @@ def main():
     cache = {}
     if os.path.exists(SHARES_CACHE):
         try:
-            with open(SHARES_CACHE, encoding="utf-8") as f:
+            with open(SHARES_CACHE, encoding="utf-8-sig") as f:
                 cache = json.load(f)
         except Exception as e:
             print("缓存损坏, 将全量重建:", e, flush=True)
