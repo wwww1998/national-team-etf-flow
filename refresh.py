@@ -550,7 +550,7 @@ table.matrix th{{font-size:10px}}
 .tbar{{width:90px}}.tbf{{background:#f0f1f4;border-radius:3px;height:10px;overflow:hidden}}
 .tbf i{{display:block;height:100%;border-radius:3px}}
 .tbf i.pos{{background:var(--pos)}}.tbf i.neg{{background:var(--neg)}}
-.hint{{background:#fff7e6;border:1px solid #ffe0a3;color:#905c00;border-radius:10px;padding:10px 14px;font-size:12px;margin-bottom:20px}}
+
 .note{{color:var(--mut);font-size:12px;margin-top:18px;line-height:1.7}}
 .svgwrap{{margin-top:16px}}
 .chartbox{{position:relative}}
@@ -577,8 +577,6 @@ svg text{{fill:var(--mut);font-size:10px}}
         <span>标的口径：中央汇金持仓宽基ETF 共 <b>{len(etfs)}</b> 只</span></div>
     </div>
   </div>
-  <div class="hint">本页面为静态自包含报表，数据由脚本生成。每日刷新：运行
-  <code>python refresh_national_team_etf.py</code> 后重新打开本页即可。</div>
   <div class="kpis">
     <div class="kpi"><div class="lb">最新交易日 {fmt_dt(dates[-1])} 合计</div>
       <div class="vl {cls(today_tot)}">{fnum(today_tot, True)}</div>
