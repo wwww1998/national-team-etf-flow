@@ -499,6 +499,35 @@ def render_html(p):
             cells += f'<td class="r {cls(v)}" title="{d} 位">{fnum(v, True)}</td>'
         hot_html += f"<tr><td><span class='mkt'>{e['m']}</span>{escape_html(e['n'])}</td>{cells}</tr>"
 
+    # 同类指数归集 · 每日净买卖明细矩阵 (最近 HOT 个交易日)
+    cat_daily = {}
+    for e in etfs:
+        cat = e.get("cat", "其他")
+        cd = cat_daily.setdefault(cat, {})
+        for d in hot_dates:
+            v = e["series"].get(d)
+            if v is not None:
+                cd[d] = cd.get(d, 0) + v
+    cat_order = sorted(cat_daily, key=lambda c: sum(cat_daily[c].get(d, 0) for d in hot_dates), reverse=True)
+    cat_daily_html = ""
+    for cat in cat_order:
+        cells = ""
+        for d in hot_dates:
+            v = cat_daily[cat].get(d)
+            if v is None:
+                cells += '<td class="r" style="color:var(--mut)">—</td>'; continue
+            if abs(v) < 0.001:
+                cells += '<td class="r zero" title="当日该类份额较前日无净变化(申赎相抵)">0</td>'; continue
+            cells += f'<td class="r {cls(v)}">{fnum(v, True)}</td>'
+        cat_daily_html += f'<tr><td><b>{escape_html(cat)}</b><span class="code">{len(agg.get(cat, []))}只</span></td>{cells}</tr>'
+    tot_cells = ""
+    for d in hot_dates:
+        v = dt.get(d, 0)
+        if abs(v) < 0.001:
+            tot_cells += '<td class="r zero" title="当日份额较前日无净变化">0</td>'; continue
+        tot_cells += f'<td class="r {cls(v)}">{fnum(v, True)}</td>'
+    cat_daily_tot = f'<tr class="ctot"><td><b>全部（{len(cat_daily)}类{len(etfs)}只）</b></td>{tot_cells}</tr>'
+
     # 表格行
     rows = ""
     for e in etfs:
@@ -687,6 +716,13 @@ svg text{{fill:var(--mut);font-size:10px}}
       <tbody>{hot_html}</tbody>
     </table></div>
     <div style="color:var(--mut);font-size:11px;margin-top:8px">「0」表示该日基金份额较上一交易日无变化（申购与赎回相抵），属正常现象，非数据缺失。</div>
+  </div>
+  <div class="card"><h2>同类指数品种 · 每日净买卖明细（最近{HOT}个交易日，亿元 · 可横向滚动）</h2>
+    <div style="overflow-x:auto"><table class="matrix">
+      <thead><tr><th>指数类别</th>{mcol_headers}</tr></thead>
+      <tbody>{cat_daily_html}{cat_daily_tot}</tbody>
+    </table></div>
+    <div style="color:var(--mut);font-size:11px;margin-top:8px">将跟踪同一指数的多只 ETF 归集加总，观察该指数方向每日整体净买卖。「0」表示该类当日份额较前日无净变化。</div>
   </div>
   <div class="note"><b>口径说明：</b>净买入 / 净卖出 =（当日基金份额 − 前一日基金份额）× 当日单位净值，正值=净买入(净申购)，负值=净卖出(净赎回)。
   份额源：上交所 〈AKShare fund_etf_scale_sse(逐日)〉、深交所 〈fund_scale_daily_szse(区间批量)〉；净值源：天天基金 〈fund_open_fund_info_em〉。
