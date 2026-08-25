@@ -1,0 +1,39 @@
+name: 每日刷新国家队ETF报表
+
+on:
+  schedule:
+    # 每个工作日 20:00(UTC+8=12:00 UTC) 收盘后运行; 周末不触发
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: pip install akshare pandas requests
+
+      - name: 运行刷新脚本(拉份额/净值/K线, 计算净买卖, 生成报表)
+        run: python refresh.py
+
+      - name: 将生成报表复制为 index.html 并提交
+        run: |
+          cp "国家队ETF每日净买入卖出报表.html" index.html
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if git diff --cached --quiet; then
+            echo "报表无变化, 跳过提交"
+          else
+            git commit -m "chore: 每日自动刷新国家队ETF净买卖报表 ($(date +%F))"
+            git push
+          fi

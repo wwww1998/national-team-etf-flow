@@ -1,0 +1,36 @@
+是什么：本目录用于发布“国家队核心宽基ETF每日净买卖报表”到 GitHub 并每日自动更新。
+
+## 已就绪（本机）
+- index.html —— 自包含报表（网页）
+- refresh_national_team_etf.py（在上一级目录，本次已复制为 refresh.py）
+- .github/workflows/daily-refresh.yml —— GitHub Actions 每工作日 20 点自动刷新并提交
+- 本机已建 Windows 计划任务“国家队ETF每日刷新”（工作日 20:00 跑脚本）
+
+## 发布到 GitHub 只剩最后一步（需要你的凭据，任选其一）
+
+方式 A：GitHub CLI（最省事）
+  1. 安装 GitHub CLI：winget install --id GitHub.cli
+  2. gh auth login  （浏览器登录一次）
+  3. 在本目录根执行：
+     git init
+     git add -A
+     git commit -m "init: 国家队ETF净买卖报表"
+     gh repo create national-team-etf-flow --public --source=. --push
+     gh repo create national-team-etf-flow --private --source=. --push   # 或私有
+
+方式 B：Personal Access Token
+  1. GitHub → Settings → Developer settings → Personal access tokens → 生成 tokens（勾选 repo / workflow 权限）
+  2. 在本目录根执行：
+     git init
+     git add -A
+     git commit -m "init: 国家队ETF净买卖报表"
+     git remote add origin https://<你的用户名>:<TOKEN>@github.com/<你的用户名>/national-team-etf-flow.git
+     git push -u origin main
+
+不管哪种方式，仓库建好后：
+- 到仓库 Settings → Pages，Source 选 Deploy from a branch → main 根目录
+- 每日更新由 GitHub Actions 的 daily-refresh.yml 自动完成（也可手动 Run workflow）
+
+## 注意
+- 需要先把 token 加入仓库 Actions 权限（若用 gh clipboard 会自动带）；若用 PAT 方式且想在本机也自动推送，需把定时任务改为“跑脚本后 git push”。
+- refresh.py 运行时需联网抓取交易所/行情数据。
