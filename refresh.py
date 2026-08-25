@@ -657,6 +657,7 @@ svg text{{fill:var(--mut);font-size:10px}}
       <div class="sub"><span>数据日 <b>{escape_html(p['data_asof'])}</b></span>
         <span>更新时间 <b>{escape_html(p['updated'])}</b></span>
         <span>标的口径：中央汇金持仓宽基ETF 共 <b>{len(etfs)}</b> 只</span></div>
+      <div style="color:var(--mut);font-size:12px;margin-top:6px">汇金 2025 年 12 月 31 日持仓约 1.5 万亿、总计 23 只。本数据无法准确检测汇金实际持仓，仅反映这 23 只 ETF 的每日净申购赎回情况。</div>
     </div>
   </div>
   <div class="kpis">
