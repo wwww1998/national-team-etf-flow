@@ -291,7 +291,23 @@ def main():
         s = sum(x["f"] for x in items_by[ds].values() if x["f"] is not None)
         date_total[ds] = s
 
-    today = dates_sorted[-1]
+    # 沪深ETF申购数据公布时间不一致: 只有当沪、深两市都更新到同一交易日时, 才把该日作为最新展示日;
+    # 若两市最新公布日不同步, 则回退到两市都有数据的最近共同交易日(通常为前一天)。
+    mkt_of = {c: m for c, _, m in TARGETS}
+    sh_have, sz_have = set(), set()
+    for ds in dates_sorted:
+        codes = set(items_by.get(ds, {}) or {})
+        if any(mkt_of.get(c) == "sh" for c in codes):
+            sh_have.add(ds)
+        if any(mkt_of.get(c) == "sz" for c in codes):
+            sz_have.add(ds)
+    sync_days = sorted(sh_have & sz_have)
+    cut = sync_days[-1] if sync_days else dates_sorted[-1]
+    if cut < dates_sorted[-1]:
+        print("沪深最新公布日不同步, 展示回退到两市同步日:", cut,
+              "(两市最新: 沪=%s 深=%s)" % (sh_have and sorted(sh_have)[-1], sz_have and sorted(sz_have)[-1]), flush=True)
+    dates_sorted = [d for d in dates_sorted if d <= cut]
+    today = cut
     week_days = dates_sorted[-5:]
     month_days = dates_sorted[-21:]
 
@@ -666,7 +682,9 @@ svg text{{fill:var(--mut);font-size:10px}}
       <h1>国家队ETF · 每日净买入 / 净卖出</h1>
       <div class="sub"><span>数据日 <b>{escape_html(p['data_asof'])}</b></span>
         <span>更新时间 <b>{escape_html(p['updated'])}</b></span>
-        <span>标的口径：中央汇金持仓宽基ETF 共 <b>{len(etfs)}</b> 只</span></div>
+        <span>标的口径：中央汇金持仓宽基ETF 共 <b>{len(etfs)}</b> 只</span>
+        <button onclick="location.reload()" title="点击重新加载，并按沪深两市同步日期展示最新数据"
+           style="cursor:pointer;margin-left:6px;padding:4px 12px;border:1px solid var(--line,#ccc);border-radius:6px;background:var(--card,#fff);color:var(--txt,#111);font-size:12px">🔄 刷新数据</button></div>
       <div style="color:var(--mut);font-size:12px;margin-top:6px">汇金 2025 年 12 月 31 日持仓约 1.5 万亿、总计 23 只。本数据无法准确检测汇金实际持仓，仅反映这 23 只 ETF 的每日净申购赎回情况。</div>
     </div>
   </div>
