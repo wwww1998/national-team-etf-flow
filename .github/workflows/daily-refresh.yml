@@ -1,6 +1,15 @@
-name: 手动刷新国家队ETF报表
+name: 每日自动刷新国家队ETF报表
 
 on:
+  schedule:
+    # 以下为北京时间对应的 UTC: 08:00/08:30/09:00/15:30/16:30/20:00/24:00 (周一~周五)
+    - cron: "0 0 * * 1-5"    # 08:00 北京
+    - cron: "30 0 * * 1-5"   # 08:30 北京
+    - cron: "0 1 * * 1-5"    # 09:00 北京
+    - cron: "30 7 * * 1-5"   # 15:30 北京
+    - cron: "30 8 * * 1-5"   # 16:30 北京
+    - cron: "0 12 * * 1-5"   # 20:00 北京
+    - cron: "0 16 * * 1-5"   # 24:00 北京
   workflow_dispatch:
 
 permissions:
@@ -11,6 +20,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 恢复历史份额数据缓存, 实现增量刷新, 避免每次全量重拉3年数据
+      # 动态key用于保存新缓存, restore-keys 前缀用于复用最近一次缓存
+      - name: 恢复份额缓存
+        uses: actions/cache@v4
+        with:
+          path: _etf_shares_cache.json
+          key: etf-shares-${{ github.run_id }}
+          restore-keys: |
+            etf-shares-
 
       - uses: actions/setup-python@v5
         with:
@@ -31,6 +50,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "报表无变化, 跳过提交"
           else
-            git commit -m "chore: 每日自动刷新国家队ETF净买卖报表 ($(date +%F))"
+            git commit -m "chore: 每日自动刷新国家队ETF净买卖报表 ($(date +%F %T) 北京+8)"
             git push
           fi

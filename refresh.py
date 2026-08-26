@@ -139,7 +139,10 @@ def fetch_kline_tx(dates):
     """备选源(腾讯) 中证全指(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量"""
     if not dates:
         return []
-    start = dates[0].replace("-", ""); end = dates[-1].replace("-", "")
+    def _d8(x):
+        s = str(x)
+        return f"{s[0:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 and s.isdigit() else s
+    start = _d8(dates[0]); end = _d8(dates[-1])
     url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
            "?param=sh000985,day,%s,%s,1600,qfq" % (start, end))
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
@@ -389,11 +392,18 @@ def render_html(p):
             _kk = f"{_kk[:4]}-{_kk[4:6]}-{_kk[6:]}"
         _mvm[_kk] = _v
     y_mv = [_mvm.get(d, 0) for d in y_dates]
-    # 近一周 / 近一月
+    # 近一周 / 近一月 / 近半年 / 近一年 / 今年以来
     week_days = dates[-5:]
     month_days = dates[-21:]
+    halfyear_days = dates[-120:]
+    oneyear_days = dates[-242:]
+    cur_year = str(datetime.now().year)
+    ytd_days = [d for d in dates if str(d)[:4] == cur_year]
     week_tot = sum(dt.get(d, 0) for d in week_days)
     month_tot = sum(dt.get(d, 0) for d in month_days)
+    halfyear_tot = sum(dt.get(d, 0) for d in halfyear_days)
+    oneyear_tot = sum(dt.get(d, 0) for d in oneyear_days)
+    ytd_tot = sum(dt.get(d, 0) for d in ytd_days)
     today_tot = dt.get(dates[-1], 0)
 
     # --- 中证全指K线联动数据 ---
@@ -603,8 +613,8 @@ body{{margin:0;font-family:-apple-system,"PingFang SC","Microsoft YaHei",system-
 h1{{font-size:22px;margin:0;font-weight:700}}
 .sub{{color:var(--mut);font-size:12px;margin-top:6px;display:flex;gap:14px;flex-wrap:wrap}}
 .sub b{{font-weight:600;color:var(--accent)}}
-.kpis{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:22px}}
-.kpi{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}}
+.kpis{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-auto-rows:1fr;gap:12px;margin-bottom:22px}}
+.kpi{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;justify-content:center}}
 .kpi .lb{{font-size:12px;color:var(--mut)}}
 .kpi .vl{{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}}
 .kpi .tg{{font-size:12px;margin-top:2px}}
@@ -663,16 +673,22 @@ svg text{{fill:var(--mut);font-size:10px}}
   <div class="kpis">
     <div class="kpi"><div class="lb">最新交易日 {fmt_dt(dates[-1])} 合计</div>
       <div class="vl {cls(today_tot)}">{fnum(today_tot, True)}</div>
-      <div class="tg {cls(today_tot)}">单位：亿元</div></div>
+      <div class="tg {cls(today_tot)}">{ "净买入" if today_tot>=0 else "净卖出" } 亿元</div></div>
     <div class="kpi"><div class="lb">近一周累计 (5个交易日)</div>
       <div class="vl {cls(week_tot)}">{fnum(week_tot, True)}</div>
-      <div class="tg {cls(week_tot)}">{ "净买入" if week_tot>=0 else "净卖出" }</div></div>
+      <div class="tg {cls(week_tot)}">{ "净买入" if week_tot>=0 else "净卖出" } 亿元</div></div>
     <div class="kpi"><div class="lb">近一月累计 (21个交易日)</div>
       <div class="vl {cls(month_tot)}">{fnum(month_tot, True)}</div>
-      <div class="tg {cls(month_tot)}">{ "净买入" if month_tot>=0 else "净卖出" }</div></div>
-    <div class="kpi"><div class="lb">近一月全部品种合计</div>
-      <div class="vl {cls(month_tot)}">{fnum(month_tot, True)}亿元</div>
-      <div class="tg">所有品种加总</div></div>
+      <div class="tg {cls(month_tot)}">{ "净买入" if month_tot>=0 else "净卖出" } 亿元</div></div>
+    <div class="kpi"><div class="lb">近半年累计 (约120个交易日)</div>
+      <div class="vl {cls(halfyear_tot)}">{fnum(halfyear_tot, True)}</div>
+      <div class="tg {cls(halfyear_tot)}">{ "净买入" if halfyear_tot>=0 else "净卖出" } 亿元</div></div>
+    <div class="kpi"><div class="lb">近一年累计 (约242个交易日)</div>
+      <div class="vl {cls(oneyear_tot)}">{fnum(oneyear_tot, True)}</div>
+      <div class="tg {cls(oneyear_tot)}">{ "净买入" if oneyear_tot>=0 else "净卖出" } 亿元</div></div>
+    <div class="kpi"><div class="lb">今年以来累计 ({cur_year}年{len(ytd_days)}个交易日)</div>
+      <div class="vl {cls(ytd_tot)}">{fnum(ytd_tot, True)}</div>
+      <div class="tg {cls(ytd_tot)}">{ "净买入" if ytd_tot>=0 else "净卖出" } 亿元</div></div>
   </div>
   <div class="card"><h2>全部品种 · 每日净买卖合计（近21个交易日，亿元）</h2>
     <div class="bars">{bars}</div>
