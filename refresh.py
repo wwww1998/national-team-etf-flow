@@ -537,23 +537,17 @@ def render_html(p):
     hot_dates = dates[-HOT:]
     hot_html = ""
     mcol_headers = "".join(f"<th>{d[5:]}</th>" for d in hot_dates)
-    # 单元格: 金额为大号文字, 倍量为小号淡字, 整格淡色底表达倍量强弱
+    # 单元格: 上行=净买卖金额(亿元,单位'亿'), 下行=倍量(单位'倍'); v=净买卖(亿), m=倍量
     def _dm_cell(v, m=None):
         if v is None:
             return '<td class="r" style="color:var(--mut)">—</td>'
         if abs(v) < 0.001:
             top, c = "0", ""
         else:
-            top, c = fnum(v, True), cls(v)
-        bg = ""
-        if m is not None and abs(m) > 0:
-            a = min(abs(m) / 10.0, 1.0) * 0.16
-            tone = "212,61,42" if m >= 0 else "31,157,123"
-            bg = f'style="background:rgba({tone},{a:.3f})"'
+            top, c = fnum(v, True) + "亿", cls(v)
         if m is None:
-            return f'<td class="r {c}" {bg}><span class="amt">{top}</span></td>'
-        return (f'<td class="r {c}" {bg}><span class="amt">{top}</span>'
-                f'<span class="m2 {cls(m)}">{m:+.2f}</span></td>')
+            return f'<td class="r {c}">{top}</td>'
+        return f'<td class="r {c}">{top}<div class="mult {cls(m)}">{m:+.2f}倍</div></td>'
     for e in etfs:
         ser = e["series"]
         bz = e.get("s2025", 0) * 0.001 if e.get("s2025", 0) > 0 else None
@@ -692,8 +686,7 @@ td{{padding:7px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tab
 td.r{{text-align:right;white-space:nowrap}}
 tr.ctot td{{border-top:2px solid var(--ink);font-weight:600;background:#fafbfc}}
 td.zero{{color:var(--mut);font-size:11px;opacity:.65}}
-.amt{{display:block;font-size:13px;font-weight:600;line-height:1.05;font-variant-numeric:tabular-nums}}
-.m2{{display:block;font-size:8.5px;opacity:.6;margin-top:2px;line-height:1;font-family:var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
+.mult{{display:block;font-size:10px;opacity:.72;margin-top:1px;font-family:var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
 table.matrix td{{font:11px var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
 table.matrix th{{font-size:10px}}
 .mkt{{display:inline-block;font-size:10px;color:var(--mut);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-right:6px}}
@@ -795,7 +788,7 @@ svg text{{fill:var(--mut);font-size:10px}}
       <thead><tr><th>品种</th>{mcol_headers}</tr></thead>
       <tbody>{hot_html}</tbody>
     </table></div>
-    <div style="color:var(--mut);font-size:11px;margin-top:8px">每格大号文字=净买卖金额(亿元)，其下小字=倍量份额（＝当日净申购(赎回)份额 ÷ 该 ETF 自身 2025-12-31 份额×0.1%）；整格淡红/淡绿底色越深倍量越强。
+    <div style="color:var(--mut);font-size:11px;margin-top:8px">每格上行=净买卖金额(亿元)，下行=倍量份额（＝当日净申购(赎回)份额 ÷ 该 ETF 自身 2025-12-31 份额×0.1%，单位倍）。
       「0」表示该日基金份额较上一交易日无变化（申购与赎回相抵），属正常现象，非数据缺失。正值=净买入(红)，负值=净卖出(绿)。</div>
   </div>
   <div class="card"><h2>同类指数品种 · 每日净买卖明细（金额 / 倍量金额 · 最近{HOT}个交易日，亿元 · 可横向滚动）</h2>
@@ -804,7 +797,7 @@ svg text{{fill:var(--mut);font-size:10px}}
       <tbody>{cat_daily_html}{cat_daily_tot}</tbody>
     </table></div>
     <div style="color:var(--mut);font-size:11px;margin-top:8px">将跟踪同一指数的多只 ETF 归集加总，观察该指数方向每日整体净买卖。
-      每格大号文字=净买卖金额(亿元)，其下小字=倍量金额（＝当日净买入金额 ÷ 该类 2025-12-31 市值×0.1%）；整格淡红/淡绿底色越深倍量越强。
+      每格上行=净买卖金额(亿元)，下行=倍量金额（＝当日净买入金额 ÷ 该类 2025-12-31 市值×0.1%，单位倍）。
       「0」表示该类当日份额较前日无净变化。正值=净买入(红)，负值=净卖出(绿)。</div>
   </div>
   <div class="note"><b>口径说明：</b>净买入 / 净卖出 =（当日基金份额 − 前一日基金份额）× 当日单位净值，正值=净买入(净申购)，负值=净卖出(净赎回)。
