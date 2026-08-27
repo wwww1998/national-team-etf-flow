@@ -77,7 +77,7 @@ CAT_MAP = {
     "512100":"中证1000","159845":"中证1000","560010":"中证1000","159629":"中证1000",
     "159915":"创业板","159952":"创业板","159977":"创业板",
     "588080":"科创板50","588050":"科创板50",
-    "510180":"上证180","510230":"上证180",
+    "510180":"上证180","510230":"上证180金融",
     "159901":"深证100",
     "515800":"中证800","560050":"MSCI中国A50",
 }
@@ -339,6 +339,25 @@ def main():
         except Exception as e2:
             print("K线拉取失败(报表其余部分不受影响):", e2)
             payload["kline"] = [None] * len(dates_sorted)
+    dsh_all, s5, n5 = {}, {}, {}
+    for code, _, _ in TARGETS:
+        # 2025-12-31 份额/净值 基准备锚，用于"每日倍量"：单只按份额、同类/全表按金额
+        _prev = None; _dd = {}
+        for _ds in dates_sorted:
+            _it = items_by.get(_ds, {}).get(code)
+            if _it:
+                _k = f"{_ds[:4]}-{_ds[4:6]}-{_ds[6:]}"
+                if _prev is not None:
+                    _dd[_k] = round((_it["s"] - _prev) / 1e8, 4)
+                _prev = _it["s"]
+        dsh_all[code] = _dd
+        s5[code] = (shares.get("20251231", {}).get(code) or 0) / 1e8
+        _nn = None
+        for _ds in sorted(nav.get(code, {})):
+            if str(_ds) <= "20251231":
+                _nn = nav[code][_ds]
+        n5[code] = _nn or 0
+
     for code, name, mkt in TARGETS:
         payload["etfs"].append({
             "c": code, "n": name, "m": "沪" if mkt == "sh" else "深",
@@ -348,6 +367,9 @@ def main():
             "month": round(m_sum.get(code, 0) / 1e8, 3),
             "last_share": (lambda c=code: (items_by.get(today, {}).get(c, {}).get("s") or 0) / 1e8)(),
             "last_nav": (items_by.get(today, {}).get(code, {}).get("w") or 0),
+            "s2025": s5.get(code, 0),
+            "n2025": n5.get(code, 0),
+            "dsh": dsh_all.get(code, {}),
             "series": {f"{ds[:4]}-{ds[4:6]}-{ds[6:]}": round((items_by.get(ds, {}).get(code, {}).get("f") or 0) / 1e8, 3)
                        for ds in dates_sorted},
         })
@@ -515,16 +537,26 @@ def render_html(p):
     hot_dates = dates[-HOT:]
     hot_html = ""
     mcol_headers = "".join(f"<th>{d[5:]}</th>" for d in hot_dates)
+    # 单元格: 上行=净买卖金额, 下行=倍量; v=净买卖(亿), m=倍量(无量纲)
+    def _dm_cell(v, m=None):
+        if v is None:
+            return '<td class="r" style="color:var(--mut)">—</td>'
+        if abs(v) < 0.001:
+            top, c = "0", ""
+        else:
+            top, c = fnum(v, True), cls(v)
+        if m is None:
+            return f'<td class="r {c}">{top}</td>'
+        return f'<td class="r {c}">{top}<div class="mult {cls(m)}">{m:+.2f}</div></td>'
     for e in etfs:
         ser = e["series"]
+        bz = e.get("s2025", 0) * 0.001 if e.get("s2025", 0) > 0 else None
+        dsh = e.get("dsh", {})
         cells = ""
         for d in hot_dates:
             v = ser.get(d)
-            if v is None:
-                cells += '<td class="r" style="color:var(--mut)">—</td>'; continue
-            if abs(v) < 0.001:
-                cells += '<td class="r zero" title="当日份额较前日无变化(申赎相抵)">0</td>'; continue
-            cells += f'<td class="r {cls(v)}" title="{d} 位">{fnum(v, True)}</td>'
+            m = (dsh.get(d) / bz) if (bz and dsh.get(d) is not None) else None
+            cells += _dm_cell(v, m)
         hot_html += f"<tr><td><span class='mkt'>{e['m']}</span>{escape_html(e['n'])}</td>{cells}</tr>"
 
     # 同类指数归集 · 每日净买卖明细矩阵 (最近 HOT 个交易日)
@@ -537,23 +569,26 @@ def render_html(p):
             if v is not None:
                 cd[d] = cd.get(d, 0) + v
     cat_order = sorted(cat_daily, key=lambda c: sum(cat_daily[c].get(d, 0) for d in hot_dates), reverse=True)
+    cat_mv = {}
+    for e in etfs:
+        g = e.get("cat", "其他")
+        cat_mv[g] = cat_mv.get(g, 0) + e.get("s2025", 0) * e.get("n2025", 0)
     cat_daily_html = ""
     for cat in cat_order:
+        cbz = cat_mv.get(cat, 0) * 0.001 if cat_mv.get(cat, 0) > 0 else None
         cells = ""
         for d in hot_dates:
             v = cat_daily[cat].get(d)
-            if v is None:
-                cells += '<td class="r" style="color:var(--mut)">—</td>'; continue
-            if abs(v) < 0.001:
-                cells += '<td class="r zero" title="当日该类份额较前日无净变化(申赎相抵)">0</td>'; continue
-            cells += f'<td class="r {cls(v)}">{fnum(v, True)}</td>'
+            m = (v / cbz) if (cbz and v is not None) else None
+            cells += _dm_cell(v, m)
         cat_daily_html += f'<tr><td><b>{escape_html(cat)}</b><span class="code">{len(agg.get(cat, []))}只</span></td>{cells}</tr>'
+    _all_mv = sum(e.get("s2025", 0) * e.get("n2025", 0) for e in etfs)
+    _all_bz = _all_mv * 0.001 if _all_mv > 0 else None
     tot_cells = ""
     for d in hot_dates:
         v = dt.get(d, 0)
-        if abs(v) < 0.001:
-            tot_cells += '<td class="r zero" title="当日份额较前日无净变化">0</td>'; continue
-        tot_cells += f'<td class="r {cls(v)}">{fnum(v, True)}</td>'
+        m = (v / _all_bz) if _all_bz and v is not None else None
+        tot_cells += _dm_cell(v, m)
     cat_daily_tot = f'<tr class="ctot"><td><b>全部（{len(cat_daily)}类{len(etfs)}只）</b></td>{tot_cells}</tr>'
 
     # 表格行
@@ -651,6 +686,7 @@ td{{padding:7px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tab
 td.r{{text-align:right;white-space:nowrap}}
 tr.ctot td{{border-top:2px solid var(--ink);font-weight:600;background:#fafbfc}}
 td.zero{{color:var(--mut);font-size:11px;opacity:.65}}
+.mult{{display:block;font-size:10px;opacity:.72;margin-top:1px;font-family:var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
 table.matrix td{{font:11px var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
 table.matrix th{{font-size:10px}}
 .mkt{{display:inline-block;font-size:10px;color:var(--mut);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-right:6px}}
@@ -747,19 +783,22 @@ svg text{{fill:var(--mut);font-size:10px}}
     </table></div>
     <div style="color:var(--mut);font-size:11px;margin-top:8px">将跟踪同一指数的多只 ETF 归集加总，观察该指数方向上的整体净买卖。</div>
   </div>
-  <div class="card"><h2>每日净买卖明细（最近{HOT}个交易日，亿元 · 可横向滚动）</h2>
+  <div class="card"><h2>每日净买卖明细 · 金额 / 倍量份额（最近{HOT}个交易日，亿元 · 可横向滚动）</h2>
     <div style="overflow-x:auto"><table class="matrix">
       <thead><tr><th>品种</th>{mcol_headers}</tr></thead>
       <tbody>{hot_html}</tbody>
     </table></div>
-    <div style="color:var(--mut);font-size:11px;margin-top:8px">「0」表示该日基金份额较上一交易日无变化（申购与赎回相抵），属正常现象，非数据缺失。</div>
+    <div style="color:var(--mut);font-size:11px;margin-top:8px">每个单元格上行=净买卖金额(亿元)，下行=倍量份额（＝当日净申购(赎回)份额 ÷ 该 ETF 自身 2025-12-31 份额×0.1%）。
+      「0」表示该日基金份额较上一交易日无变化（申购与赎回相抵），属正常现象，非数据缺失。正值=净买入(红)，负值=净卖出(绿)。</div>
   </div>
-  <div class="card"><h2>同类指数品种 · 每日净买卖明细（最近{HOT}个交易日，亿元 · 可横向滚动）</h2>
+  <div class="card"><h2>同类指数品种 · 每日净买卖明细（金额 / 倍量金额 · 最近{HOT}个交易日，亿元 · 可横向滚动）</h2>
     <div style="overflow-x:auto"><table class="matrix">
       <thead><tr><th>指数类别</th>{mcol_headers}</tr></thead>
       <tbody>{cat_daily_html}{cat_daily_tot}</tbody>
     </table></div>
-    <div style="color:var(--mut);font-size:11px;margin-top:8px">将跟踪同一指数的多只 ETF 归集加总，观察该指数方向每日整体净买卖。「0」表示该类当日份额较前日无净变化。</div>
+    <div style="color:var(--mut);font-size:11px;margin-top:8px">将跟踪同一指数的多只 ETF 归集加总，观察该指数方向每日整体净买卖。
+      每个单元格上行=净买卖金额(亿元)，下行=倍量金额（＝当日净买入金额 ÷ 该类 2025-12-31 市值×0.1%）。
+      「0」表示该类当日份额较前日无净变化。正值=净买入(红)，负值=净卖出(绿)。</div>
   </div>
   <div class="note"><b>口径说明：</b>净买入 / 净卖出 =（当日基金份额 − 前一日基金份额）× 当日单位净值，正值=净买入(净申购)，负值=净卖出(净赎回)。
   份额源：上交所 〈AKShare fund_etf_scale_sse(逐日)〉、深交所 〈fund_scale_daily_szse(区间批量)〉；净值源：天天基金 〈fund_open_fund_info_em〉。
