@@ -7,7 +7,7 @@
 """
 import akshare as ak
 from datetime import datetime, timedelta, timezone
-import json, time, os, io, sys, shutil, requests
+import json, time, os, io, sys, shutil, requests, re
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(OUT_DIR, "国家队ETF每日净买入卖出报表.html")
@@ -63,6 +63,24 @@ def sync_day_of(shares, valid):
         return inter[-1]
     uni = sorted(sh | sz)
     return uni[-1] if uni else None
+
+def last_published_state():
+    """读取上一份报表的 (数据日, 更新时间), 用于数据未推进时沿用旧时间戳, 使输出字节不变、工作流跳过提交"""
+    cands = [REPORT]
+    if os.path.exists(os.path.join(os.getcwd(), "index.html")):
+        cands.append(os.path.join(os.getcwd(), "index.html"))
+    for p in cands:
+        if not os.path.exists(p):
+            continue
+        try:
+            s = open(p, encoding="utf-8-sig").read()
+        except Exception:
+            continue
+        day = re.search(r"数据日\s*<b>(\d{8})</b>", s)
+        upd = re.search(r"更新时间\s*<b>([^<]+)</b>", s)
+        if day:
+            return {"day": day.group(1), "updated": (upd.group(1) if upd else None)}
+    return None
 
 def load_shares_cached(window_dates, cache):
     """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start)"""
@@ -357,8 +375,12 @@ def main():
         return dc
     w_sum = cum(week_days); m_sum = cum(month_days)
 
+    lpub = last_published_state()
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if lpub and lpub.get("day") == today:
+        stamp = lpub.get("updated") or stamp
     payload = {
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "updated": stamp,
         "data_asof": today,
         "deep_start": deep_start,
         "dates": [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in dates_sorted],
