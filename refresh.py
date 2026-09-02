@@ -6,7 +6,7 @@
 净买入/净卖出 = (当日份额 - 前一日份额) × 当日单位净值 (正=净买入, 负=净卖出)
 """
 import akshare as ak
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json, time, os, io, sys, shutil, requests
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +37,32 @@ def incremental_dates(cache, cal_days):
     if start > refresh:
         start = refresh
     return gen_cal_days(start, today)
+
+FRESH_RETRY = 2          # 数据滞后时最多重试次数
+FRESH_WAIT = 150         # 每次重试间隔秒数
+
+def expected_latest_cut():
+    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末/节假日自动回落到上一个工作日"""
+    d = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).date()
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return int(d.strftime("%Y%m%d"))
+
+def sync_day_of(shares, valid):
+    """沪深两市都有数据的最近共同交易日; 仅单边有数据时退化为该单边最新日"""
+    mkt_of = {c: m for c, _, m in TARGETS}
+    sh, sz = set(), set()
+    for ds in valid:
+        cds = set(shares.get(ds, {}))
+        if any(mkt_of.get(c) == "sh" for c in cds):
+            sh.add(ds)
+        if any(mkt_of.get(c) == "sz" for c in cds):
+            sz.add(ds)
+    inter = sorted(sh & sz)
+    if inter:
+        return inter[-1]
+    uni = sorted(sh | sz)
+    return uni[-1] if uni else None
 
 def load_shares_cached(window_dates, cache):
     """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start)"""
@@ -258,6 +284,17 @@ def main():
     print("本次拉取日期窗口: %s ~ %s (共%d个工作日)" %
           (window[0] if window else "-", window[-1] if window else "-", len(window)), flush=True)
     shares, valid, deep_start = load_shares_cached(window, cache)
+    # 数据新鲜度自检: 若展示日落后于最近已结束交易日(通常因数据源晚发布/单边失败), 等待后重试抓取
+    exp = expected_latest_cut()
+    for _attempt in range(FRESH_RETRY):
+        cur = sync_day_of(shares, valid)
+        stale = cur is not None and int(cur) < exp
+        print("数据新鲜度: 最新同步日=%s 期望=%s %s" %
+              (cur, exp, "正常" if not stale else "滞后, 稍后重试"), flush=True)
+        if not stale or not window:
+            break
+        time.sleep(FRESH_WAIT)
+        shares, valid, deep_start = load_shares_cached(window, cache)
     with open(SHARES_CACHE, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False)
     if not valid:
