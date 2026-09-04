@@ -569,18 +569,24 @@ def render_html(p):
         agg.setdefault(e.get("cat", "其他"), []).append(e)
     cat_rows_html = ""
     cat_share_tot = cat_today_tot = cat_week_tot = cat_month_tot = cat_mv_tot = 0.0
+    cat_s25_tot = cat_mv25_tot = 0.0
     for cat in sorted(agg, key=lambda c: sum(x["month"] for x in agg[c]), reverse=True):
         es = agg[cat]
         td = sum(x["today"] for x in es); wk = sum(x["week"] for x in es)
         mo = sum(x["month"] for x in es); sh = sum(x["last_share"] for x in es)
         mv = sum(x["last_share"] * x["last_nav"] for x in es)
+        s25 = sum(x.get("s2025", 0) for x in es)
+        mv25 = sum(x.get("s2025", 0) * x.get("n2025", 0) for x in es)
         cat_today_tot += td; cat_week_tot += wk; cat_month_tot += mo; cat_share_tot += sh; cat_mv_tot += mv
+        cat_s25_tot += s25; cat_mv25_tot += mv25
         w = min(abs(mo) / 200 * 100, 100)
         cat_rows_html += f"""<tr>
           <td><b>{escape_html(cat)}</b><span class="code">{len(es)}只</span></td>
           <td class="r {cls(td)}">{fnum(td, True)}</td>
           <td class="r {cls(wk)}">{fnum(wk, True)}</td>
           <td class="r {cls(mo)}">{fnum(mo, True)}</td>
+          <td class="r">{s25:,.1f}</td>
+          <td class="r">{mv25:,.1f}</td>
           <td class="r">{sh:,.1f}</td>
           <td class="r">{mv:,.1f}</td>
           <td class="tbar"><div class="tbf"><i class="{cls(mo)}" style="width:{w:.0f}%"></i></div></td></tr>"""
@@ -588,6 +594,8 @@ def render_html(p):
       <td class="r {cls(cat_today_tot)}">{fnum(cat_today_tot, True)}</td>
       <td class="r {cls(cat_week_tot)}">{fnum(cat_week_tot, True)}</td>
       <td class="r {cls(cat_month_tot)}">{fnum(cat_month_tot, True)}</td>
+      <td class="r">{cat_s25_tot:,.1f}</td>
+      <td class="r">{cat_mv25_tot:,.1f}</td>
       <td class="r">{cat_share_tot:,.1f}</td>
       <td class="r">{cat_mv_tot:,.1f}</td><td></td></tr>"""
 
@@ -837,7 +845,7 @@ svg text{{fill:var(--mut);font-size:10px}}
   </div>
   <div class="card"><h2>同类指数品种归集汇总（亿元）</h2>
     <div style="overflow-x:auto"><table>
-      <thead><tr><th>指数类别</th><th>今日</th><th>近一周</th><th>近一月</th><th>最新份额(亿)</th><th>持仓市值(亿)</th><th style="width:90px">近一月强度</th></tr></thead>
+      <thead><tr><th>指数类别</th><th>今日</th><th>近一周</th><th>近一月</th><th>2025-12-31份额(亿)</th><th>2025-12-31市值(亿)</th><th>最新份额(亿)</th><th>持仓市值(亿)</th><th style="width:90px">近一月强度</th></tr></thead>
       <tbody>{cat_rows_html}{cat_tot_row}</tbody>
     </table></div>
     <div style="color:var(--mut);font-size:11px;margin-top:8px">将跟踪同一指数的多只 ETF 归集加总，观察该指数方向上的整体净买卖。</div>
