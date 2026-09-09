@@ -26,16 +26,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 恢复历史份额数据缓存, 实现增量刷新, 避免每次全量重拉3年数据
-      # 动态key用于保存新缓存, restore-keys 前缀用于复用最近一次缓存
-      - name: 恢复份额缓存
-        uses: actions/cache@v4
-        with:
-          path: _etf_shares_cache.json
-          key: etf-shares-${{ github.run_id }}
-          restore-keys: |
-            etf-shares-
-
+      # 份额历史缓存已纳入仓库(_etf_shares_cache.json), checkout即得完整5年基线;
+      # refresh.py 每次增量拉取并写回, 下方提交阶段将更新后的缓存一并提交回推, 云端自持不依赖本地/actions-cache
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -46,15 +38,15 @@ jobs:
       - name: 运行刷新脚本(拉份额/净值/K线, 计算净买卖, 生成报表)
         run: python refresh.py
 
-      - name: 将生成报表复制为 index.html 并提交
+      - name: 将生成报表复制为 index.html 并提交(含份额缓存回写)
         run: |
           cp "国家队ETF每日净买入卖出报表.html" index.html
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add index.html
+          git add index.html _etf_shares_cache.json
           if git diff --cached --quiet; then
             echo "报表无变化, 跳过提交"
           else
-            git commit -m "chore: 每日自动刷新国家队ETF净买卖报表 ($(date +%F %T) 北京+8)"
+            git commit -m "chore: 每日自动刷新国家队ETF净买卖报表 ($(date +%F\ %T) 北京+8)"
             git push
           fi

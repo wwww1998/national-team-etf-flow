@@ -23,16 +23,21 @@ def gen_cal_days(start_d, end_d):
     return out
 
 def incremental_dates(cache, cal_days):
-    """增量拉取窗口: 有缓存则只拉最近若干天(含补拉最近12天以便捕获晚发布), 无缓存则全量构建"""
+    """增量拉取窗口: 有缓存则只拉最近若干天(含补拉最近12天以便捕获晚发布), 无缓存则全量构建;
+    缓存起始晚于5年窗口时, 从5年起点补齐缺失历史(仅需一次, 补足后缓存即含完整5年)."""
     hist = (cache or {}).get("shares", {})
     today = datetime.now()
     if not hist:
         return natural_dates(cal_days)
     try:
         lastc = datetime.strptime(max(hist), "%Y%m%d")
+        firstc = datetime.strptime(min(hist), "%Y%m%d")
     except Exception:
-        lastc = today - timedelta(days=1)
+        lastc = today - timedelta(days=1); firstc = today
+    five_years = today - timedelta(days=cal_days)   # 5年窗口起点(约5年前同日期)
     start = lastc + timedelta(days=1)
+    if firstc > five_years:
+        start = five_years   # 历史不足, 从5年起点补齐
     refresh = today - timedelta(days=12)
     if start > refresh:
         start = refresh
@@ -125,7 +130,23 @@ CAT_MAP = {
     "159901":"深证100",
     "515800":"中证800","560050":"MSCI中国A50",
 }
-CAL_DAYS = 1100  # 约3年(约786个工作日) 覆盖最大历史
+
+
+# 各类指数 → 行情K线源(东财secid, 腾讯code)。用于"各类指数K线 × 该类ETF净买入联动"图
+CAT_INDEX = {
+    "沪深300":    ("1.000300", "sh000300"),
+    "上证50":     ("1.000016", "sh000016"),
+    "中证500":    ("1.000905", "sh000905"),
+    "中证1000":   ("1.000852", "sh000852"),
+    "创业板":     ("0.399006", "sz399006"),
+    "科创板50":   ("1.000688", "sh000688"),
+    "上证180":    ("1.000010", "sh000010"),
+    "上证180金融":  ("1.000018", "sh000018"),
+    "深证100":    ("0.399330", "sz399330"),
+    "中证800":    ("1.000906", "sh000906"),
+    "MSCI中国A50": ("1.746059", "sh746059"),
+}
+CAL_DAYS = 1850  # 约5年(约1300个工作日) 覆盖全报表5年历史
 
 def retry(fn, tries=3, gap=2):
     last = None
@@ -145,15 +166,15 @@ def natural_dates(n):
         d -= timedelta(days=1)
     return dates
 
-def fetch_kline(dates):
-    """直连东财拉取中证全指(000985)日K, 按 dates 对齐返回 [{d,o,h,l,c}|None]. 东财单次限约999条."""
+def fetch_kline(dates, secid="1.000985"):
+    """直连东财拉取指数(secid, 默认中证全指000985)日K, 按 dates 对齐返回 [{d,o,h,l,c}|None]. 东财单次限约999条."""
     if not dates:
         return []
     start = dates[0].replace("-", ""); end = dates[-1].replace("-", "")
     url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
            "?fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56"
-           "&ut=7eea3edcaed734bea9cbfc24409ed989&klt=101&fqt=0&secid=1.000985"
-           "&beg=%s&end=%s&smplmt=1000&lmt=200000" % (start, end))
+           "&ut=7eea3edcaed734bea9cbfc24409ed989&klt=101&fqt=0&secid=%s"
+           "&beg=%s&end=%s&smplmt=1000&lmt=200000" % (secid, start, end))
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
 
     def _get():
@@ -179,8 +200,8 @@ def fetch_kline(dates):
     return [({"d": d, "o": m[k][0], "h": m[k][1], "l": m[k][2], "c": m[k][3]}
              if (k := d.replace("-", "")) in m else None) for d in dates]
 
-def fetch_kline_tx(dates):
-    """备选源(腾讯) 中证全指(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量"""
+def fetch_kline_tx(dates, tx_code="sh000985"):
+    """备选源(腾讯) 指数(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量"""
     if not dates:
         return []
     def _d8(x):
@@ -188,7 +209,7 @@ def fetch_kline_tx(dates):
         return f"{s[0:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 and s.isdigit() else s
     start = _d8(dates[0]); end = _d8(dates[-1])
     url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-           "?param=sh000985,day,%s,%s,1600,qfq" % (start, end))
+           "?param=%s,day,%s,%s,1600,qfq" % (tx_code, start, end))
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
 
     def _get():
@@ -198,7 +219,7 @@ def fetch_kline_tx(dates):
         d = j.get("data")
         rows = None
         if isinstance(d, dict):
-            for sym in ("sh000985", "qfqday", "day"):
+            for sym in (tx_code, "qfqday", "day"):
                 v = d.get(sym)
                 if isinstance(v, dict):
                     rows = v.get("qfqday") or v.get("day") or v.get("data")
@@ -321,15 +342,23 @@ def main():
 
     daily = []
     for code, name, mkt in TARGETS:
-        prev = None; lnav = None
+        prev = None; lnav = None; prev_nav = None
         for ds in valid:
             v = shares.get(ds, {}).get(code)
             if v is None:
                 continue
             nn = nav.get(code, {}).get(ds)
             if nn is not None:
+                prev_nav = lnav   # 上一有净值日的净值
                 lnav = nn
             net = (v - prev) * lnav if (prev is not None and lnav is not None) else None
+            # 份额合并(折算)判定: 份额等比骤变 与 净值反向等比联动(乘积≈1) => 非实际申赎, 净买卖置0
+            if prev is not None and v != prev and net is not None and prev_nav and lnav:
+                rs = v / prev          # 份额变化比(合并折半<1 / 拆分加倍>1)
+                rn = lnav / prev_nav   # 净值反向比(合并后>1 / 拆分后<1)
+                if (abs(rs - 1.0) > 0.30 and (rs - 1.0) * (rn - 1.0) < 0
+                        and 0.6 < rs * rn < 1.6):
+                    net = 0.0
             daily.append({"d": ds, "c": code, "n": name, "m": mkt, "s": v,
                           "w": lnav, "f": net})
             prev = v
@@ -342,9 +371,17 @@ def main():
         items_by.setdefault(it["d"], {})[it["c"]] = it
     dates_sorted = sorted({it["d"] for it in daily})
     date_total = {}
+    cat_total = {}   # 类别 → {日期: 该类别下所有ETF当日净买入合计}
     for ds in dates_sorted:
         s = sum(x["f"] for x in items_by[ds].values() if x["f"] is not None)
         date_total[ds] = s
+        per_cat = {}
+        for c, it in items_by[ds].items():
+            if it["f"] is None:
+                continue
+            cat = CAT_MAP.get(c, "其他")
+            per_cat[cat] = per_cat.get(cat, 0) + it["f"]
+        cat_total[ds] = per_cat
 
     # 沪深ETF申购数据公布时间不一致: 只有当沪、深两市都更新到同一交易日时, 才把该日作为最新展示日;
     # 若两市最新公布日不同步, 则回退到两市都有数据的最近共同交易日(通常为前一天)。
@@ -379,12 +416,25 @@ def main():
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     if lpub and lpub.get("day") == today:
         stamp = lpub.get("updated") or stamp
+    # 各类指数K线: 逐类尝试东财secid, 失败退腾讯; 全部失败则该类为 None 列表
+    cat_kline = {}
+    for _cat, (_e_sec, _tx) in CAT_INDEX.items():
+        try:
+            cat_kline[_cat] = fetch_kline(dates_sorted, _e_sec)
+        except Exception as _e:
+            try:
+                cat_kline[_cat] = fetch_kline_tx(dates_sorted, _tx)
+            except Exception as _e2:
+                print(f"指数K线失败 {_cat}: {_e2}", flush=True)
+                cat_kline[_cat] = [None] * len(dates_sorted)
     payload = {
         "updated": stamp,
         "data_asof": today,
         "deep_start": deep_start,
         "dates": [f"{d[:4]}-{d[4:6]}-{d[6:]}" for d in dates_sorted],
         "date_total": {k: round(v / 1e8, 3) for k, v in date_total.items()},
+        "cat_total": {str(k): {cc: round(vv / 1e8, 3) for cc, vv in v.items()} for k, v in cat_total.items()},
+        "cat_kline": cat_kline,
         "etfs": [],
     }
     try:
@@ -503,55 +553,86 @@ def render_html(p):
     ytd_tot = sum(dt.get(d, 0) for d in ytd_days)
     today_tot = dt.get(dates[-1], 0)
 
-    # --- 中证全指K线联动数据 ---
-    kline = p.get("kline") or [None] * len(dates)
-    K_ARR = json.dumps([x for x in kline], ensure_ascii=False)
-    Q_ARR = json.dumps([round(dt.get(d, 0), 3) for d in dates])
+    # --- 各类指数K线联动数据 (下拉切换) ---
+    _dates_fmt = dates
+    _cat_dt = {}   # 转键: YYYYMMDD -> YYYY-MM-DD, 供每类每日净买入取值
+    for _ck, _cv in (p.get("cat_total") or {}).items():
+        _ckk = str(_ck)
+        if len(_ckk) == 8:
+            _ckk = f"{_ckk[:4]}-{_ckk[4:6]}-{_ckk[6:]}"
+        _cat_dt[_ckk] = _cv
+    _tot_dt = {}   # 中证全指: 全市场每日净买入合计(键转YYYY-MM-DD)
+    for _tk, _tv in (p.get("date_total") or {}).items():
+        _tkk = str(_tk)
+        if len(_tkk) == 8:
+            _tkk = f"{_tkk[:4]}-{_tkk[4:6]}-{_tkk[6:]}"
+        _tot_dt[_tkk] = _tv
+    # 每类: 该类当日ETF净买入合计(k键=YYYY-MM-DD, 含缺失天填0); 中证全指在首项
+    def _cat_series(cat):
+        return [round((_cat_dt.get(d, {}) or {}).get(cat, 0), 3) for d in _dates_fmt]
+    i_kl_names = ["中证全指"] + list(CAT_INDEX.keys())
+    _zzkl = p.get("kline") or [None] * len(dates)
+    i_kl_series = [_zzkl] + [p.get("cat_kline", {}).get(cat) or [None] * len(dates) for cat in i_kl_names[1:]]
+    _tot_series = [round(_tot_dt.get(d, 0), 3) for d in _dates_fmt]
+    i_qd_series = [_tot_series] + [_cat_series(cat) for cat in i_kl_names[1:]]
+    INAMES = json.dumps(i_kl_names, ensure_ascii=False)
+    ISERIES = json.dumps(i_kl_series, ensure_ascii=False)
+    ISERIES_Q = json.dumps(i_qd_series, ensure_ascii=False)
     D_ARR = json.dumps(dates, ensure_ascii=False)
     KLN_JS = ("<script>\n"
-      "var DATA_K=" + K_ARR + ";\n"
-      "var DATA_Q=" + Q_ARR + ";\n"
+      "var IDX_NAMES=" + INAMES + ";\n"
+      "var IDX_K=" + ISERIES + ";\n"
+      "var IDX_Q=" + ISERIES_Q + ";\n"
       "var DATA_D=" + D_ARR + ";\n"
       "(function(){\n"
       "function go(){\n"
       " var box=document.getElementById('klnBox');\n"
+      " var sel=document.getElementById('klnCat');\n"
       " if(!window.echarts){var t=document.getElementById('klnTip');if(t)t.textContent='图表库未加载(需联网)';return;}\n"
-      " var chart=echarts.init(box),cur=120;\n"
-      " function opt(n){\n"
+      " var chart=echarts.init(box),cur=120,ci=0;\n"
+      " function opt(n,ci2){\n"
+      "  var K=IDX_K[ci2],Q=IDX_Q[ci2];\n"
       "  var s=(n>0)?Math.max(0,DATA_D.length-n):0,tail=(s>0)?{startValue:s,endValue:DATA_D.length-1} : null;\n"
-      "  var ds=DATA_D.slice(s),ks=DATA_K.slice(s),qs=DATA_Q.slice(s);\n"
+      "  var ds=DATA_D.slice(s),ks=K.slice(s),qs=Q.slice(s);\n"
       "  return {axisPointer:{link:[{xAxisIndex:[0,1]}],lineStyle:{color:'#98a2b8'}},\n"
-      "   grid:[{left:50,right:56,top:16,height:300,gridIndex:0},{left:50,right:56,bottom:10,height:130,gridIndex:1}],\n"
+      "   grid:[{left:50,right:56,top:16,height:300,gridIndex:0},{left:50,right:56,bottom:28,height:120,gridIndex:1}],\n"
       "   xAxis:[{type:'category',data:ds,gridIndex:0,boundaryGap:true,axisLine:{lineStyle:{color:'#c9cfdd'}},axisLabel:{color:'#7a8194',fontSize:10},axisTick:{show:false}},\n"
       "          {type:'category',data:ds,gridIndex:1,axisLine:{lineStyle:{color:'#c9cfdd'}},axisLabel:{show:false},axisTick:{show:false}}],\n"
       "   yAxis:[{scale:true,gridIndex:0,position:'right',splitLine:{lineStyle:{color:'#eef1f6'}},axisLabel:{color:'#7a8194',fontSize:10}},\n"
       "          {scale:true,gridIndex:1,position:'right',splitLine:{show:false},axisLabel:{color:'#7a8194',fontSize:10,formatter:function(v){return v.toFixed(0);}}}],\n"
+      "   dataZoom:[{type:'inside',xAxisIndex:[0,1],zoomOnMouseWheel:true,moveOnMouseMove:true,moveOnMouseWheel:true,throttle:50},\n"
+      "             {type:'slider',xAxisIndex:[0,1],height:18,bottom:0,startValue:0,endValue:ds.length-1,brushSelect:false,textStyle:{fontSize:9,color:'#7a8194'},borderColor:'#dfe4ef',fillerColor:'rgba(99,126,188,0.12)',handleStyle:{color:'#b7c2da'},dataBackground:{lineStyle:{color:'#c9d2e4'},areaStyle:{color:'rgba(99,126,188,0.06)'}}}],\n"
       "   series:[\n"
-      "    {name:'中证全指',type:'candlestick',data:ks.map(function(x){return x?[x.o,x.c,x.l,x.h]:[null,null,null,null];}),\n"
+      "    {name:'指数K线',type:'candlestick',data:ks.map(function(x){return x?[x.o,x.c,x.l,x.h]:[null,null,null,null];}),\n"
       "     itemStyle:{color:'#d43d2a',color0:'#1f9d7b',borderColor:'#d43d2a',borderColor0:'#1f9d7b'}},\n"
-      "    {name:'当日净买卖',type:'bar',xAxisIndex:1,yAxisIndex:1,data:qs,\n"
+      "    {name:'该类ETF净买卖',type:'bar',xAxisIndex:1,yAxisIndex:1,data:qs,\n"
       "     itemStyle:{color:function(p){return p.value>=0?'#d43d2a':'#1f9d7b';}}}\n"
       "   ],\n"
       "   tooltip:{trigger:'axis',axisPointer:{type:'cross'},position:[8,338],confine:true,backgroundColor:'#2a2f3a',borderWidth:0,textStyle:{color:'#fff',fontSize:12},extraCssText:'white-space:nowrap;max-width:880px;padding:6px 10px;box-shadow:0 2px 8px rgba(0,0,0,.15);',\n"
-      "    formatter:function(ps){var i=ps[0].dataIndex,g=i+s,d=DATA_D[g],k=DATA_K[g]||{},q=DATA_Q[g];\n"
+      "    formatter:function(ps){var i=ps[0].dataIndex,g=i+s,d=DATA_D[g],k=K[g]||{},q=Q[g];\n"
       "     var s1='';\n"
       "     if(k.o!=null){s1=' &nbsp;开'+k.o+' 高'+k.h+' 低'+k.l+' 收'+k.c;}\n"
       "     var col=q>=0?'#f0705c':'#46c7a6';\n"
-      "     return '<b>'+d+'</b>'+s1+' &nbsp;当日净买卖 <b style=\"color:'+col+'\">'+(q>=0?'+':'')+q.toFixed(2)+' 亿</b>';}}\n"
+      "     var lab=(ci2===0)?'当日净买卖':'该类ETF净买卖';\n"
+      "     return '<b>'+d+'</b>'+s1+' &nbsp;'+lab+' <b style=\"color:'+col+'\">'+(q>=0?'+':'')+q.toFixed(2)+' 亿</b>';}}\n"
       "  };\n"
       " }\n"
-      " chart.setOption(opt(cur));\n"
+      " chart.setOption(opt(cur,ci));\n"
+      " function upd(){chart.setOption(opt(cur,ci),true);}\n"
+      " sel.addEventListener('change',function(){ci=sel.selectedIndex;chart.setOption(opt(cur,ci));});\n"
       " var btns=document.querySelectorAll('.rng');\n"
       " Array.prototype.forEach.call(btns,function(b){b.addEventListener('click',function(){\n"
-      "   cur=parseInt(b.getAttribute('data-n'),10)||120;\n"
+      "   var _n2=parseInt(b.getAttribute('data-n'),10);cur=(_n2===0)?0:(isNaN(_n2)?120:_n2);\n"
       "   Array.prototype.forEach.call(btns,function(x){x.classList.toggle('sel',x===b);});\n"
-      "   chart.setOption(opt(cur));\n"
+      "   chart.setOption(opt(cur,ci));\n"
       " });});\n"
-      " window.addEventListener('resize',function(){chart.resize();});\n"
+      "window.addEventListener('resize',function(){chart.resize();});\n"
       "}\n"
       "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',go);}else{go();}\n"
       "})();\n"
       "</script>")
+
+    _cat_opts = "".join('<option%s>%s</option>' % (' selected' if i == 0 else '', _n) for i, _n in enumerate(i_kl_names))
 
     # 内联 ECharts，避免境外 CDN 在本机加载失败导致图表空白
     _EC_PATH = r"C:\Users\wxk11\.trae-cn\memory\echarts.min.js"
@@ -827,15 +908,17 @@ svg text{{fill:var(--mut);font-size:10px}}
     </div></div>
     {JS_CODE}
   </div>
-  <div class="card"><h2>中证全指K线 × 每日净买入联动（上K线 下当日净买卖 · 悬停查看）</h2>
-    <div class="klnctl"><span class="kp">显示范围</span>
+  <div class="card"><h2>指数K线 × 每日净买入联动（上K线 下当日净买卖 · 悬停查看）</h2>
+    <div class="klnctl"><span class="kp">指数</span>
+      <select id="klnCat" style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg)">{_cat_opts}</select>
+      <span class="kp" style="margin-left:10px">显示范围</span>
       <button class="rng" data-n="60">60日</button>
       <button class="rng sel" data-n="120">120日</button>
       <button class="rng" data-n="250">250日</button>
       <button class="rng" data-n="0">全部</button>
       <span class="kpt" id="klnDate"></span></div>
     <div id="klnBox" style="height:520px;width:100%"></div>
-    <div id="klnTip" class="ktip">中证全指与国家队ETF每日净买卖按交易日对齐，鼠标悬停可联动查看当天K线与净买卖，红=净买入、绿=净卖出。</div>
+    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至11类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元），鼠标悬停联动查看；红=净买入、绿=净卖出。</div>
   </div>
   <div class="card"><h2>分品种汇总 · 近一周 / 近一月净买入卖出（亿元，按近一月降序）</h2>
     <div style="overflow-x:auto"><table>
