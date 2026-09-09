@@ -292,6 +292,23 @@ def load_shares(dates):
             deep_start = sz_have[0]
     return daily_shares, valid, deep_start
 
+def fetch_em_share(code):
+    """东财实时总份额(份): push2 行情接口 f84=基金总份额. 云端可达, 用于上交所份额取数失败时的沪市兜底."""
+    secid = ("1." if code.startswith(("5", "6")) else "0.") + code
+    url = ("https://push2.eastmoney.com/api/qt/stock/get?invt=2&fltt=2"
+           "&fields=f57,f84&secid=" + secid)
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+
+    def _get():
+        j = requests.get(url, headers=headers, timeout=20).json()
+        d = j.get("data") or {}
+        v = d.get("f84")
+        if v is None:
+            raise ValueError("no f84")
+        return float(v)
+
+    return retry(_get, tries=3, gap=2)
+
 def load_nav():
     nav = {}
     for code, _, _ in TARGETS:
@@ -334,6 +351,23 @@ def main():
             break
         time.sleep(FRESH_WAIT)
         shares, valid, deep_start = load_shares_cached(window, cache)
+    # 沪市最新交易日兜底: 云端/个别环境访问上交所受限(fund_etf_scale_sse 常失败), 若最近已结束交易日缺沪份额,
+    # 用东财实时总份额(f84)补入, 保证沪深同步日能推进到最近交易日; 历史缺口待上交所接口恢复后由增量拉取回补
+    _sh_live = [c for c, _, _m in TARGETS if _m == "sh"]
+    _exp_s = str(exp)
+    if _sh_live and not any(shares.get(_exp_s, {}).get(c) for c in _sh_live):
+        _filled = 0
+        for _c in _sh_live:
+            try:
+                _p = fetch_em_share(_c)
+            except Exception:
+                _p = None
+            if _p:
+                shares.setdefault(_exp_s, {})[_c] = _p
+                _filled += 1
+        if _filled:
+            valid = sorted(set(valid) | {_exp_s})
+            print(f"沪市东财快照兜底: 补入 {_exp_s} 沪市 {_filled} 只份额", flush=True)
     with open(SHARES_CACHE, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False)
     if not valid:
