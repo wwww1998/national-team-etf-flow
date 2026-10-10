@@ -46,10 +46,31 @@ def incremental_dates(cache, cal_days):
 FRESH_RETRY = 2          # 数据滞后时最多重试次数
 FRESH_WAIT = 150         # 每次重试间隔秒数
 
-def expected_latest_cut():
-    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末/节假日自动回落到上一个工作日"""
+def load_trade_calendar(cache):
+    """A股交易日历(YYYYMMDD集合). 优先复用缓存(须覆盖到今日之后), 否则拉取新浪交易日历并写回缓存.
+    失败时返回已缓存的部分或 None, 上层退化为仅按工作日过滤(不会中断报表生成)."""
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+    td = cache.get("trade_days") or {}
+    days = sorted(td.get("days") or [])
+    if days and days[-1] >= today:
+        return set(days)
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        days = sorted({str(x)[:10].replace("-", "") for x in df["trade_date"]})
+        if days:
+            cache["trade_days"] = {"days": days, "end": days[-1]}
+            print("交易日历已更新: %s ~ %s (共%d个交易日)" % (days[0], days[-1], len(days)), flush=True)
+            return set(days)
+    except Exception as e:
+        print("交易日历拉取失败(退化为工作日过滤):", str(e)[:80], flush=True)
+    return set(days) if days else None
+
+def expected_latest_cut(trade_days=None):
+    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末与法定节假日自动回落到上一交易日"""
     d = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).date()
-    while d.weekday() >= 5:
+    for _ in range(400):
+        if d.weekday() < 5 and (not trade_days or d.strftime("%Y%m%d") in trade_days):
+            return int(d.strftime("%Y%m%d"))
         d -= timedelta(days=1)
     return int(d.strftime("%Y%m%d"))
 
@@ -87,13 +108,18 @@ def last_published_state():
             return {"day": day.group(1), "updated": (upd.group(1) if upd else None)}
     return None
 
-def load_shares_cached(window_dates, cache):
-    """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start)"""
+def load_shares_cached(window_dates, cache, trade_days=None):
+    """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start).
+    trade_days 非空时: 丢弃非交易日(法定节假日/周末)份额, 防止节假日被快照兜底误填成"幽灵交易日"污染X轴."""
     hist = cache.setdefault("shares", {})
     fetched, valid_fetch, ds_start = load_shares(window_dates)
     for d, m in fetched.items():
-        if m:
+        if m and (not trade_days or d in trade_days):
             hist.setdefault(d, {}).update(m)
+    if trade_days:
+        cal_last = max(trade_days)
+        for d in [x for x in list(hist) if x not in trade_days and x <= cal_last]:
+            del hist[d]
     if ds_start:
         cached_ds = cache.get("deep_start")
         if not cached_ds or str(ds_start) < str(cached_ds):
@@ -339,9 +365,10 @@ def main():
     window = incremental_dates(cache, CAL_DAYS)
     print("本次拉取日期窗口: %s ~ %s (共%d个工作日)" %
           (window[0] if window else "-", window[-1] if window else "-", len(window)), flush=True)
-    shares, valid, deep_start = load_shares_cached(window, cache)
+    trade_days = load_trade_calendar(cache)
+    shares, valid, deep_start = load_shares_cached(window, cache, trade_days)
     # 数据新鲜度自检: 若展示日落后于最近已结束交易日(通常因数据源晚发布/单边失败), 等待后重试抓取
-    exp = expected_latest_cut()
+    exp = expected_latest_cut(trade_days)
     for _attempt in range(FRESH_RETRY):
         cur = sync_day_of(shares, valid)
         stale = cur is not None and int(cur) < exp
@@ -350,12 +377,14 @@ def main():
         if not stale or not window:
             break
         time.sleep(FRESH_WAIT)
-        shares, valid, deep_start = load_shares_cached(window, cache)
+        shares, valid, deep_start = load_shares_cached(window, cache, trade_days)
     # 沪市最新交易日兜底: 云端/个别环境访问上交所受限(fund_etf_scale_sse 常失败), 若最近已结束交易日缺沪份额,
-    # 用东财实时总份额(f84)补入, 保证沪深同步日能推进到最近交易日; 历史缺口待上交所接口恢复后由增量拉取回补
+    # 用东财实时总份额(f84)补入, 保证沪深同步日能推进到最近交易日; 历史缺口待上交所接口恢复后由增量拉取回补。
+    # 仅当 exp 确为交易日时才兜底, 避免节假日(如国庆/中秋)被误填成"幽灵交易日"在K线图上留空。
     _sh_live = [c for c, _, _m in TARGETS if _m == "sh"]
     _exp_s = str(exp)
-    if _sh_live and not any(shares.get(_exp_s, {}).get(c) for c in _sh_live):
+    _exp_is_trade = (not trade_days) or (_exp_s in trade_days)
+    if _sh_live and _exp_is_trade and not any(shares.get(_exp_s, {}).get(c) for c in _sh_live):
         _filled = 0
         for _c in _sh_live:
             try:
