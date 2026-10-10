@@ -66,11 +66,14 @@ def load_trade_calendar(cache):
     return set(days) if days else None
 
 def expected_latest_cut(trade_days=None):
-    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末与法定节假日自动回落到上一交易日"""
+    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末与法定节假日自动回落到上一交易日.
+    日期超出日历覆盖范围(如跨年日历尚未更新)时退化为仅按工作日判断, 避免误判."""
     d = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).date()
+    cal_last = max(trade_days) if trade_days else ""
     for _ in range(400):
-        if d.weekday() < 5 and (not trade_days or d.strftime("%Y%m%d") in trade_days):
-            return int(d.strftime("%Y%m%d"))
+        ds = d.strftime("%Y%m%d")
+        if d.weekday() < 5 and (ds > cal_last or ds in trade_days):
+            return int(ds)
         d -= timedelta(days=1)
     return int(d.strftime("%Y%m%d"))
 
