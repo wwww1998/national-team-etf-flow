@@ -7,6 +7,7 @@
 """
 import akshare as ak
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import json, time, os, io, sys, shutil, requests, re
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +124,14 @@ def load_shares_cached(window_dates, cache, trade_days=None):
         cal_last = max(trade_days)
         for d in [x for x in list(hist) if x not in trade_days and x <= cal_last]:
             del hist[d]
+    # 沪市接口按日返回全市场ETF: 仅保留跟踪标的, 避免缓存随每日新增代码无限膨胀
+    keep = {c for c, _, _ in TARGETS}
+    for d in list(hist):
+        m = {c: v for c, v in hist[d].items() if c in keep}
+        if m:
+            hist[d] = m
+        else:
+            del hist[d]
     if ds_start:
         cached_ds = cache.get("deep_start")
         if not cached_ds or str(ds_start) < str(cached_ds):
@@ -141,11 +150,19 @@ TARGETS = [
     ("560010","中证1000ETF 广发","sh"),("159629","中证1000ETF 富国","sz"),
     ("159915","创业板ETF 易方达","sz"),("159952","创业板ETF 广发","sz"),
     ("159977","创业板ETF 天弘","sz"),
+    ("159949","创业板50ETF 华安","sz"),
     ("588080","科创板50ETF 易方达","sh"),("588050","科创板50ETF 工银","sh"),
+    ("588000","科创50ETF 华夏","sh"),
+    ("563300","A500ETF 华泰柏瑞","sh"),("159338","中证A500ETF 国泰","sz"),
+    ("159352","A500ETF 南方","sz"),("159361","A500ETF 易方达","sz"),
     ("510180","上证180ETF 华安","sh"),("510230","上证180金融ETF 国泰","sh"),
     ("159901","深证100ETF 易方达","sz"),
     ("515800","中证800ETF 汇添富","sh"),("560050","MSCI中国A50ETF 汇添富","sh"),
 ]
+
+# 2026-10 救市口径新增纳入的标的(此前报表未跟踪), 在明细行内打标
+NEW_TAG = "2026.10救市"
+NEW_TAG_CODES = {"588000", "563300", "159338", "159352", "159361", "159949"}
 
 # 同类指数归集
 CAT_MAP = {
@@ -154,7 +171,9 @@ CAT_MAP = {
     "510500":"中证500","512500":"中证500","159922":"中证500",
     "512100":"中证1000","159845":"中证1000","560010":"中证1000","159629":"中证1000",
     "159915":"创业板","159952":"创业板","159977":"创业板",
-    "588080":"科创板50","588050":"科创板50",
+    "159949":"创业板50",
+    "588080":"科创板50","588050":"科创板50","588000":"科创板50",
+    "563300":"中证A500","159338":"中证A500","159352":"中证A500","159361":"中证A500",
     "510180":"上证180","510230":"上证180金融",
     "159901":"深证100",
     "515800":"中证800","560050":"MSCI中国A50",
@@ -168,11 +187,13 @@ CAT_INDEX = {
     "中证500":    ("1.000905", "sh000905"),
     "中证1000":   ("1.000852", "sh000852"),
     "创业板":     ("0.399006", "sz399006"),
+    "创业板50":   ("0.399673", "sz399673"),
     "科创板50":   ("1.000688", "sh000688"),
     "上证180":    ("1.000010", "sh000010"),
     "上证180金融":  ("1.000018", "sh000018"),
     "深证100":    ("0.399330", "sz399330"),
     "中证800":    ("1.000906", "sh000906"),
+    "中证A500":   ("1.000510", "sh000510"),
     "MSCI中国A50": ("1.746059", "sh746059"),
 }
 CAL_DAYS = 1850  # 约5年(约1300个工作日) 覆盖全报表5年历史
@@ -355,6 +376,94 @@ def load_nav():
             print(f"  净值 fail {code}: {str(e)[:70]}", flush=True)
     return nav
 
+SH_BACKFILL_FROM = "20251231"   # 沪市新增标的的历史回补起点(含当日, 保证 2025-12-31 基线与近一年口径可用)
+SH_BACKFILL_WORKERS = 8         # 沪市接口按日单取, 并发回补提速(仅新标的一次性回补时启用)
+COVER_MIN = 60                  # 标的在缓存中的交易日覆盖数低于该值, 视为"新增标的"需回补历史
+
+def backfill_new_codes(cache, trade_days=None):
+    """新纳入标的的历史份额一次性回补(仅写入新增标的自身份额, 不膨胀缓存).
+    深市: fund_scale_daily_szse 45天区间批量, 回补全部缓存区间; 沪市: fund_etf_scale_sse 按日并发, 回补 SH_BACKFILL_FROM 之后.
+    完成后写入 cache['hist_done'], 后续运行不再重复回补."""
+    hist = cache.setdefault("shares", {})
+    done = cache.setdefault("hist_done", {})
+    cover = {}
+    for m in hist.values():
+        for c in m:
+            cover[c] = cover.get(c, 0) + 1
+    gap = [c for c, _, _ in TARGETS if not done.get(c) and cover.get(c, 0) < COVER_MIN]
+    if not gap:
+        return 0
+    days = [d for d in sorted(hist) if (not trade_days or d in trade_days)]
+    if not days:
+        return 0
+    mkt = {c: mk for c, _, mk in TARGETS}
+    sh_gap = [c for c in gap if mkt.get(c) == "sh"]
+    sz_gap = [c for c in gap if mkt.get(c) == "sz"]
+    filled = 0
+
+    def _take(df, keep):
+        n = 0
+        if df is None or len(df) == 0:
+            return 0
+        dcol = "日期" if "日期" in df.columns else "统计日期"
+        for _, row in df.iterrows():
+            try:
+                code = str(row.get("基金代码")).zfill(6)
+                v = float(row.get("基金份额"))
+            except Exception:
+                continue
+            dd = str(row.get(dcol))[:10].replace("-", "")
+            if code in keep and len(dd) == 8 and dd.isdigit() and (not trade_days or dd in trade_days):
+                hist.setdefault(dd, {})[code] = v
+                n += 1
+        return n
+
+    if sh_gap:
+        sh_days = [d for d in days if d >= SH_BACKFILL_FROM]
+        keep = set(sh_gap)
+        print("沪市新增标的历史回补: %s 自 %s 起共%d日" %
+              (",".join(sh_gap), sh_days[0] if sh_days else "-", len(sh_days)), flush=True)
+
+        def _one(ds):
+            try:
+                return _take(ak.fund_etf_scale_sse(date=ds), keep)
+            except Exception:
+                return 0
+
+        with ThreadPoolExecutor(max_workers=SH_BACKFILL_WORKERS) as ex:
+            futs = [ex.submit(_one, ds) for ds in sh_days]
+            for i, fu in enumerate(futs, 1):
+                filled += fu.result()
+                if i % 50 == 0 or i == len(futs):
+                    print("  沪市回补进度 %d/%d" % (i, len(futs)), flush=True)
+        for c in sh_gap:
+            n = sum(1 for m in hist.values() if c in m)
+            print("  沪市回补完成 %s: 累计%d个交易日" % (c, n), flush=True)
+            if n >= 5:
+                done[c] = "1"
+
+    if sz_gap:
+        keep = set(sz_gap)
+        CH = 45
+        print("深市新增标的历史回补: %s 共%d个交易日区间" % (",".join(sz_gap), len(days)), flush=True)
+        for i in range(0, len(days), CH):
+            s = days[i]; e = days[min(i + CH - 1, len(days) - 1)]
+            try:
+                sdf = retry(lambda s=s, e=e: ak.fund_scale_daily_szse(
+                    start_date=s, end_date=e, symbol="ETF"), tries=2, gap=3)
+            except Exception as ex:
+                print("  深市回补 fail %s~%s: %s" % (s, e, str(ex)[:50]), flush=True)
+                continue
+            filled += _take(sdf, keep)
+        for c in sz_gap:
+            n = sum(1 for m in hist.values() if c in m)
+            print("  深市回补完成 %s: 累计%d个交易日" % (c, n), flush=True)
+            if n >= 5:
+                done[c] = "1"
+
+    cache["hist_done"] = done
+    return filled
+
 def main():
     print("拉取数据中 ...", flush=True)
     cache = {}
@@ -370,6 +479,10 @@ def main():
           (window[0] if window else "-", window[-1] if window else "-", len(window)), flush=True)
     trade_days = load_trade_calendar(cache)
     shares, valid, deep_start = load_shares_cached(window, cache, trade_days)
+    # 新增纳入标的(如 2026.10救市口径)无历史缓存: 一次性回补其历史份额, 保证近一月/近一年与 2025-12-31 基线可用
+    if backfill_new_codes(cache, trade_days):
+        shares = cache.get("shares", {})
+        valid = sorted(d for d, m in shares.items() if m)
     # 数据新鲜度自检: 若展示日落后于最近已结束交易日(通常因数据源晚发布/单边失败), 等待后重试抓取
     exp = expected_latest_cut(trade_days)
     for _attempt in range(FRESH_RETRY):
@@ -578,6 +691,8 @@ def render_html(p):
         return s
     def cls(v):
         return "pos" if v >= 0 else "neg"
+    def ftag(code):
+        return f'<span class="tag">{NEW_TAG}</span>' if code in NEW_TAG_CODES else ''
     dates = p["dates"]
     dt = {}
     for k, v in p["date_total"].items():
@@ -771,7 +886,7 @@ def render_html(p):
             v = ser.get(d)
             m = (dsh.get(d) / bz) if (bz and dsh.get(d) is not None) else None
             cells += _dm_cell(v, m)
-        hot_html += f"<tr><td><span class='mkt'>{e['m']}</span>{escape_html(e['n'])}</td>{cells}</tr>"
+        hot_html += f"<tr><td><span class='mkt'>{e['m']}</span>{escape_html(e['n'])}{ftag(e['c'])}</td>{cells}</tr>"
 
     # 同类指数归集 · 每日净买卖明细矩阵 (最近 HOT 个交易日)
     cat_daily = {}
@@ -809,7 +924,7 @@ def render_html(p):
     rows = ""
     for e in etfs:
         rows += f"""<tr>
-          <td><span class="mkt">{e['m']}</span>{escape_html(e['n'])}<span class="code">{e['c']}</span></td>
+          <td><span class="mkt">{e['m']}</span>{escape_html(e['n'])}{ftag(e['c'])}<span class="code">{e['c']}</span></td>
           <td class="r">{e['last_share']:,.1f}</td>
           <td class="r {cls(e['today'])}">{fnum(e['today'], True)}</td>
           <td class="r {cls(e['week'])}">{fnum(e['week'], True)}</td>
@@ -905,6 +1020,8 @@ table.matrix td{{font:11px var(--font-mono,"SFMono-Regular",Consolas,monospace)}
 table.matrix th{{font-size:10px}}
 .mkt{{display:inline-block;font-size:10px;color:var(--mut);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-right:6px}}
 .code{{color:var(--mut);font-size:11px;margin-left:6px}}
+.tag{{display:inline-block;font-size:10px;line-height:15px;color:#b45309;background:#fff7ed;
+  border:1px solid #fed7aa;border-radius:4px;padding:0 5px;margin-left:6px;vertical-align:1px;font-weight:500;white-space:nowrap}}
 .tbar{{width:90px}}.tbf{{background:#f0f1f4;border-radius:3px;height:10px;overflow:hidden}}
 .tbf i{{display:block;height:100%;border-radius:3px}}
 .tbf i.pos{{background:var(--pos)}}.tbf i.neg{{background:var(--neg)}}
@@ -935,7 +1052,7 @@ svg text{{fill:var(--mut);font-size:10px}}
         <span>标的口径：中央汇金持仓宽基ETF 共 <b>{len(etfs)}</b> 只</span>
         <button onclick="location.reload()" title="点击重新加载，并按沪深两市同步日期展示最新数据"
            style="cursor:pointer;margin-left:6px;padding:4px 12px;border:1px solid var(--line,#ccc);border-radius:6px;background:var(--card,#fff);color:var(--txt,#111);font-size:12px">🔄 刷新数据</button></div>
-      <div style="color:var(--mut);font-size:12px;margin-top:6px">汇金 2025 年 12 月 31 日持仓约 1.5 万亿、总计 23 只。本数据无法准确检测汇金实际持仓，仅反映这 23 只 ETF 的每日净申购赎回情况。</div>
+      <div style="color:var(--mut);font-size:12px;margin-top:6px">汇金 2025 年 12 月 31 日持仓约 1.5 万亿、本表跟踪 {len(etfs)} 只。本数据无法准确检测汇金实际持仓，仅反映这 {len(etfs)} 只 ETF 的每日净申购赎回情况。</div>
     </div>
   </div>
   <div class="kpis">
@@ -984,13 +1101,14 @@ svg text{{fill:var(--mut);font-size:10px}}
       <button class="rng" data-n="0">全部</button>
       <span class="kpt" id="klnDate"></span></div>
     <div id="klnBox" style="height:520px;width:100%"></div>
-    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至11类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元），鼠标悬停联动查看；红=净买入、绿=净卖出。</div>
+    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至{len(CAT_INDEX)}类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元），鼠标悬停联动查看；红=净买入、绿=净卖出。</div>
   </div>
   <div class="card"><h2>分品种汇总 · 近一周 / 近一月净买入卖出（亿元，按近一月降序）</h2>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>品种</th><th>最新份额(亿)</th><th>今日</th><th>近一周</th><th>近一月</th><th style="width:90px">近一月强度</th></tr></thead>
       <tbody>{rows}</tbody>
     </table></div>
+    <div style="color:var(--mut);font-size:11px;margin-top:8px">标注「{NEW_TAG}」的标的为 2026 年 10 月救市名单中新增纳入、此前报表未跟踪的品种（{len(NEW_TAG_CODES)} 只）。</div>
   </div>
   <div class="card"><h2>同类指数品种归集汇总（亿元）</h2>
     <div style="overflow-x:auto"><table>
