@@ -194,7 +194,8 @@ CAT_INDEX = {
     "深证100":    ("0.399330", "sz399330"),
     "中证800":    ("1.000906", "sh000906"),
     "中证A500":   ("1.000510", "sh000510"),
-    "MSCI中国A50": ("1.746059", "sh746059"),
+    # MSCI 中国A50 互联互通指数在东财/腾讯均无行情, 用跟踪它的 560050 价格走势代理
+    "MSCI中国A50": ("1.560050", "sh560050"),
 }
 CAL_DAYS = 1850  # 约5年(约1300个工作日) 覆盖全报表5年历史
 
@@ -216,15 +217,14 @@ def natural_dates(n):
         d -= timedelta(days=1)
     return dates
 
-def fetch_kline(dates, secid="1.000985"):
-    """直连东财拉取指数(secid, 默认中证全指000985)日K, 按 dates 对齐返回 [{d,o,h,l,c}|None]. 东财单次限约999条."""
-    if not dates:
-        return []
-    start = dates[0].replace("-", ""); end = dates[-1].replace("-", "")
+KLINE_CACHE = "_kline_cache.json"
+
+def _em_kline(secid, beg, end):
+    """东财单次日K请求. 注意: smplmt 即单次返回条数上限, 设小了长区间会被截断(旧的 smplmt=1000 只能拿999根)."""
     url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
            "?fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56"
            "&ut=7eea3edcaed734bea9cbfc24409ed989&klt=101&fqt=0&secid=%s"
-           "&beg=%s&end=%s&smplmt=1000&lmt=200000" % (secid, start, end))
+           "&beg=%s&end=%s&smplmt=10000&lmt=200000" % (secid, beg, end))
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
 
     def _get():
@@ -236,65 +236,131 @@ def fetch_kline(dates, secid="1.000985"):
             raise ValueError("empty klines")
         return ks
 
-    data = retry(_get, tries=5, gap=6)
+    return retry(_get, tries=3, gap=4)
+
+def fetch_kline(dates, secid="1.000985"):
+    """直连东财拉取指数(secid, 默认中证全指000985)日K, 按 dates 对齐返回 [{d,o,h,l,c}|None].
+    按年分片请求后合并, 避免单次请求条数上限导致早段被截断; 部分年份失败时其余年份仍然可用."""
+    if not dates:
+        return []
     m = {}
-    for line in data:
-        f = line.split(",")
-        k = f[0].replace("-", "")
-        if k.isdigit() and len(k) == 8:
-            # 顺序: 日期,开,收,高,低,...
-            m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
-                    round(float(f[4]), 3), round(float(f[2]), 3)]
+    err = None
+    for y in range(int(dates[0][:4]), int(dates[-1][:4]) + 1):
+        try:
+            for line in _em_kline(secid, "%d0101" % y, "%d1231" % y):
+                f = line.split(",")
+                k = f[0].replace("-", "")
+                if k.isdigit() and len(k) == 8:
+                    # 顺序: 日期,开,收,高,低,...
+                    m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
+                            round(float(f[4]), 3), round(float(f[2]), 3)]
+        except Exception as e:
+            err = e
+            print("  东财K线分片失败 %s %d年: %s" % (secid, y, str(e)[:50]), flush=True)
     if not m:
-        return [None for _ in dates]
+        raise ValueError("empty klines: %s" % (err,))
     return [({"d": d, "o": m[k][0], "h": m[k][1], "l": m[k][2], "c": m[k][3]}
              if (k := d.replace("-", "")) in m else None) for d in dates]
 
 def fetch_kline_tx(dates, tx_code="sh000985"):
-    """备选源(腾讯) 指数(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量"""
+    """备选源(腾讯) 指数(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量
+    同样按年分片, 避免 count 上限截断早段."""
     if not dates:
         return []
+
     def _d8(x):
         s = str(x)
         return f"{s[0:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 and s.isdigit() else s
-    start = _d8(dates[0]); end = _d8(dates[-1])
-    url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-           "?param=%s,day,%s,%s,1600,qfq" % (tx_code, start, end))
+
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
-
-    def _get():
-        j = requests.get(url, headers=headers, timeout=45).json()
-        if not isinstance(j, dict):
-            raise ValueError("bad resp type")
-        d = j.get("data")
-        rows = None
-        if isinstance(d, dict):
-            for sym in (tx_code, "qfqday", "day"):
-                v = d.get(sym)
-                if isinstance(v, dict):
-                    rows = v.get("qfqday") or v.get("day") or v.get("data")
-                elif isinstance(v, list) and v:
-                    rows = v
-                if rows:
-                    break
-        elif isinstance(d, list) and d:
-            rows = d
-        if not rows:
-            raise ValueError("empty tx klines")
-        return rows
-
-    rows = retry(_get, tries=8, gap=8)
     m = {}
-    for f in rows:
+    err = None
+    for y in range(int(dates[0][:4]), int(dates[-1][:4]) + 1):
+        url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+               "?param=%s,day,%d-01-01,%d-12-31,800,qfq" % (tx_code, y, y))
+
+        def _get():
+            j = requests.get(url, headers=headers, timeout=45).json()
+            if not isinstance(j, dict):
+                raise ValueError("bad resp type")
+            d = j.get("data")
+            rows = None
+            if isinstance(d, dict):
+                for sym in (tx_code, "qfqday", "day"):
+                    v = d.get(sym)
+                    if isinstance(v, dict):
+                        rows = v.get("qfqday") or v.get("day") or v.get("data")
+                    elif isinstance(v, list) and v:
+                        rows = v
+                    if rows:
+                        break
+            elif isinstance(d, list) and d:
+                rows = d
+            if not rows:
+                raise ValueError("empty tx klines")
+            return rows
+
         try:
-            if len(f) >= 5 and f[0].isdigit() is False and "-" in f[0]:
-                k = f[0].replace("-", "")
-                m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
-                        round(float(f[4]), 3), round(float(f[2]), 3)]
-        except Exception:
-            pass
+            rows = retry(_get, tries=3, gap=6)
+        except Exception as e:
+            err = e
+            print("  腾讯K线分片失败 %s %d年: %s" % (tx_code, y, str(e)[:50]), flush=True)
+            continue
+        for f in rows:
+            try:
+                if len(f) >= 5 and "-" in str(f[0]):
+                    k = str(f[0]).replace("-", "")
+                    m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
+                            round(float(f[4]), 3), round(float(f[2]), 3)]
+            except Exception:
+                pass
+    if not m:
+        raise ValueError("empty tx klines: %s" % (err,))
     return [({"d": d, "o": m[k][0], "h": m[k][1], "l": m[k][2], "c": m[k][3]}
              if (k := d.replace("-", "")) in m else None) for d in dates]
+
+def load_kline_cache():
+    try:
+        j = json.load(open(KLINE_CACHE, encoding="utf-8-sig"))
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+def merge_kline(dates, arr, cmap):
+    """用缓存 cmap(键=YYYYMMDD -> [开,高,低,收]) 补齐 arr 中的 None, 同时把本次有效数据回写 cmap.
+    保证取数偶发失败时图表不出现整段空白."""
+    out, hit = [], 0
+    for d, it in zip(dates, arr or []):
+        k = str(d).replace("-", "")
+        if it:
+            cmap[k] = [it["o"], it["h"], it["l"], it["c"]]
+            out.append(it)
+        elif k in cmap:
+            v = cmap[k]
+            out.append({"d": d, "o": v[0], "h": v[1], "l": v[2], "c": v[3]})
+            hit += 1
+        else:
+            out.append(None)
+    return out, hit
+
+def save_kline_cache(cache, keep_dates):
+    """只保留当前窗口内的 K 线, 防止缓存文件逐年膨胀."""
+    if not isinstance(cache, dict):
+        return
+    keep = set(str(d).replace("-", "") for d in (keep_dates or []))
+    if keep:
+        for sec in ("kline",):
+            if isinstance(cache.get(sec), dict):
+                cache[sec] = {k: v for k, v in cache[sec].items() if k in keep}
+        for name, sub in list((cache.get("cat") or {}).items()):
+            cache["cat"][name] = {k: v for k, v in sub.items() if k in keep}
+    try:
+        tmp = KLINE_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, KLINE_CACHE)
+    except Exception as e:
+        print("K线缓存写入失败:", str(e)[:80], flush=True)
 
 def load_shares(dates):
     """沪: fund_etf_scale_sse 逐日; 深: fund_scale_daily_szse 区间批量"""
@@ -595,7 +661,9 @@ def main():
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     if lpub and lpub.get("day") == today:
         stamp = lpub.get("updated") or stamp
-    # 各类指数K线: 逐类尝试东财secid, 失败退腾讯; 全部失败则该类为 None 列表
+    # 各类指数K线: 逐类尝试东财secid, 失败退腾讯; 仍缺的用历史K线缓存补齐(保证不出现整段空白)
+    _kcache = load_kline_cache()
+    _kcat = _kcache.setdefault("cat", {})
     cat_kline = {}
     for _cat, (_e_sec, _tx) in CAT_INDEX.items():
         try:
@@ -606,6 +674,10 @@ def main():
             except Exception as _e2:
                 print(f"指数K线失败 {_cat}: {_e2}", flush=True)
                 cat_kline[_cat] = [None] * len(dates_sorted)
+        cat_kline[_cat], _hit = merge_kline(dates_sorted, cat_kline[_cat],
+                                            _kcat.setdefault(_cat, {}))
+        if _hit:
+            print(f"  {_cat} K线缓存补齐 {_hit} 日", flush=True)
     payload = {
         "updated": stamp,
         "data_asof": today,
@@ -627,6 +699,12 @@ def main():
         except Exception as e2:
             print("K线拉取失败(报表其余部分不受影响):", e2)
             payload["kline"] = [None] * len(dates_sorted)
+    payload["kline"], _hit = merge_kline(dates_sorted, payload["kline"],
+                                        _kcache.setdefault("kline", {}))
+    _ok = sum(1 for x in payload["kline"] if x)
+    print("中证全指K线: 有效 %d/%d 日%s" % (_ok, len(dates_sorted),
+          (", 缓存补齐%d日" % _hit) if _hit else ""), flush=True)
+    save_kline_cache(_kcache, dates_sorted)
     dsh_all, s5, n5 = {}, {}, {}
     for code, _, _ in TARGETS:
         # 2025-12-31 份额/净值 基准备锚，用于"每日倍量"：单只按份额、同类/全表按金额
@@ -1078,7 +1156,7 @@ svg text{{fill:var(--mut);font-size:10px}}
   <div class="card"><h2>全部品种 · 每日净买卖合计（近21个交易日，亿元）</h2>
     <div class="bars">{bars}</div>
     <div class="svgwrap"><div class="chartbox">
-      <h2 style="font-size:14px">累计持仓金额 · 最长 {len(y_dates)}个交易日（亿元 · 悬停查看当日）</h2>
+      <h2 style="font-size:14px">累计持仓金额 · 最长 {len(y_dates)}个交易日（亿元）</h2>
       <div id="cumTip" class="cumtip"></div>
       <svg id="cumSvg" viewBox="0 0 {W} {H}" width="100%" height="{H}" preserveAspectRatio="none">
         <line id="cumGuide" x1="-10" y1="{pad}" x2="-10" y2="{H-pad}" stroke="#c0c6d4" stroke-width="1" stroke-dasharray="3 3"/>
@@ -1091,7 +1169,7 @@ svg text{{fill:var(--mut);font-size:10px}}
     </div></div>
     {JS_CODE}
   </div>
-  <div class="card"><h2>指数K线 × 每日净买入联动（上K线 下当日净买卖 · 悬停查看）</h2>
+  <div class="card"><h2>指数K线 × 每日净买入联动（上K线 下当日净买卖）</h2>
     <div class="klnctl"><span class="kp">指数</span>
       <select id="klnCat" style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg)">{_cat_opts}</select>
       <span class="kp" style="margin-left:10px">显示范围</span>
@@ -1101,7 +1179,7 @@ svg text{{fill:var(--mut);font-size:10px}}
       <button class="rng" data-n="0">全部</button>
       <span class="kpt" id="klnDate"></span></div>
     <div id="klnBox" style="height:520px;width:100%"></div>
-    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至{len(CAT_INDEX)}类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元），鼠标悬停联动查看；红=净买入、绿=净卖出。</div>
+    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至{len(CAT_INDEX)}类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元）；红=净买入、绿=净卖出。</div>
   </div>
   <div class="card"><h2>分品种汇总 · 近一周 / 近一月净买入卖出（亿元，按近一月降序）</h2>
     <div style="overflow-x:auto"><table>

@@ -38,12 +38,13 @@ jobs:
       - name: 运行刷新脚本(拉份额/净值/K线, 计算净买卖, 生成报表)
         run: python refresh.py
 
-      - name: 将生成报表复制为 index.html 并提交(含份额缓存回写)
+      - name: 将生成报表复制为 index.html 并提交(含份额/ K线缓存回写)
         run: |
           cp "国家队ETF每日净买入卖出报表.html" index.html
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html _etf_shares_cache.json
+          [ -f _kline_cache.json ] && git add _kline_cache.json
           if git diff --cached --quiet; then
             echo "报表无变化, 跳过提交"
           else
