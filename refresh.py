@@ -7,6 +7,7 @@
 """
 import akshare as ak
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 import json, time, os, io, sys, shutil, requests, re
 
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,10 +47,34 @@ def incremental_dates(cache, cal_days):
 FRESH_RETRY = 2          # 数据滞后时最多重试次数
 FRESH_WAIT = 150         # 每次重试间隔秒数
 
-def expected_latest_cut():
-    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末/节假日自动回落到上一个工作日"""
+def load_trade_calendar(cache):
+    """A股交易日历(YYYYMMDD集合). 优先复用缓存(须覆盖到今日之后), 否则拉取新浪交易日历并写回缓存.
+    失败时返回已缓存的部分或 None, 上层退化为仅按工作日过滤(不会中断报表生成)."""
+    today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y%m%d")
+    td = cache.get("trade_days") or {}
+    days = sorted(td.get("days") or [])
+    if days and days[-1] >= today:
+        return set(days)
+    try:
+        df = ak.tool_trade_date_hist_sina()
+        days = sorted({str(x)[:10].replace("-", "") for x in df["trade_date"]})
+        if days:
+            cache["trade_days"] = {"days": days, "end": days[-1]}
+            print("交易日历已更新: %s ~ %s (共%d个交易日)" % (days[0], days[-1], len(days)), flush=True)
+            return set(days)
+    except Exception as e:
+        print("交易日历拉取失败(退化为工作日过滤):", str(e)[:80], flush=True)
+    return set(days) if days else None
+
+def expected_latest_cut(trade_days=None):
+    """最近一个已结束交易日(YYYYMMDD), 按北京时间; 周末与法定节假日自动回落到上一交易日.
+    日期超出日历覆盖范围(如跨年日历尚未更新)时退化为仅按工作日判断, 避免误判."""
     d = (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=1)).date()
-    while d.weekday() >= 5:
+    cal_last = max(trade_days) if trade_days else ""
+    for _ in range(400):
+        ds = d.strftime("%Y%m%d")
+        if d.weekday() < 5 and (ds > cal_last or ds in trade_days):
+            return int(ds)
         d -= timedelta(days=1)
     return int(d.strftime("%Y%m%d"))
 
@@ -87,13 +112,26 @@ def last_published_state():
             return {"day": day.group(1), "updated": (upd.group(1) if upd else None)}
     return None
 
-def load_shares_cached(window_dates, cache):
-    """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start)"""
+def load_shares_cached(window_dates, cache, trade_days=None):
+    """拉取窗口数据并合并进持久化缓存, 返回 (合并后shares, 所有有数据日期, deep_start).
+    trade_days 非空时: 丢弃非交易日(法定节假日/周末)份额, 防止节假日被快照兜底误填成"幽灵交易日"污染X轴."""
     hist = cache.setdefault("shares", {})
     fetched, valid_fetch, ds_start = load_shares(window_dates)
     for d, m in fetched.items():
-        if m:
+        if m and (not trade_days or d in trade_days):
             hist.setdefault(d, {}).update(m)
+    if trade_days:
+        cal_last = max(trade_days)
+        for d in [x for x in list(hist) if x not in trade_days and x <= cal_last]:
+            del hist[d]
+    # 沪市接口按日返回全市场ETF: 仅保留跟踪标的, 避免缓存随每日新增代码无限膨胀
+    keep = {c for c, _, _ in TARGETS}
+    for d in list(hist):
+        m = {c: v for c, v in hist[d].items() if c in keep}
+        if m:
+            hist[d] = m
+        else:
+            del hist[d]
     if ds_start:
         cached_ds = cache.get("deep_start")
         if not cached_ds or str(ds_start) < str(cached_ds):
@@ -102,30 +140,51 @@ def load_shares_cached(window_dates, cache):
     valid = sorted(d for d in cached_days if hist[d])
     return hist, valid, cache.get("deep_start")
 
+# 池子口径: 23只汇金持仓 + 新品种中 11-02/11-03/11-04 三日平均净买入>=2亿者
 TARGETS = [
     ("510300","沪深300ETF 华泰柏瑞","sh"),("510310","沪深300ETF 易方达","sh"),
     ("510330","沪深300ETF 华夏","sh"),("159919","沪深300ETF 嘉实","sz"),
+    ("515330","沪深300ETF 天弘","sh"),
     ("510050","上证50ETF 华夏","sh"),("510100","上证50ETF 易方达","sh"),
     ("510500","中证500ETF 南方","sh"),("512500","中证500ETF 华夏","sh"),
     ("159922","中证500ETF 嘉实","sz"),
     ("512100","中证1000ETF 南方","sh"),("159845","中证1000ETF 华夏","sz"),
     ("560010","中证1000ETF 广发","sh"),("159629","中证1000ETF 富国","sz"),
+    ("159633","中证1000ETF 易方达","sz"),
     ("159915","创业板ETF 易方达","sz"),("159952","创业板ETF 广发","sz"),
     ("159977","创业板ETF 天弘","sz"),
-    ("588080","科创板50ETF 易方达","sh"),("588050","科创板50ETF 工银","sh"),
+    ("588080","科创50ETF 易方达","sh"),("588050","科创50ETF 工银","sh"),
+    ("588000","科创50ETF 华夏","sh"),
+    ("563360","A500ETF 华泰柏瑞","sh"),("512050","A500ETF 华夏","sh"),
+    ("563800","A500ETF 广发","sh"),("563220","A500ETF 富国","sh"),
+    ("159338","中证A500ETF 国泰","sz"),("159352","A500ETF 南方","sz"),
+    ("159361","A500ETF 易方达","sz"),("159351","A500ETF 嘉实","sz"),
     ("510180","上证180ETF 华安","sh"),("510230","上证180金融ETF 国泰","sh"),
     ("159901","深证100ETF 易方达","sz"),
     ("515800","中证800ETF 汇添富","sh"),("560050","MSCI中国A50ETF 汇添富","sh"),
 ]
 
+# 2026-10 救市口径新增纳入的标的(原有23只之外的全部), 在明细行内打标
+NEW_TAG = "2026.10救市"
+# 原有23只口径: 2025 年报披露的汇金系持仓宽基ETF, 在明细行内打标
+BASE_TAG = "2025末汇金持仓"
+BASE23 = {"510300","510310","510330","159919","510050","510100","510500","512500",
+          "159922","512100","159845","560010","159629","159915","159952","159977",
+          "588080","588050","159901","510180","510230","515800","560050"}
+NEW_TAG_CODES = {c for c, _, _ in TARGETS} - BASE23
+
 # 同类指数归集
 CAT_MAP = {
     "510300":"沪深300","510310":"沪深300","510330":"沪深300","159919":"沪深300",
+    "515330":"沪深300",
     "510050":"上证50","510100":"上证50",
     "510500":"中证500","512500":"中证500","159922":"中证500",
     "512100":"中证1000","159845":"中证1000","560010":"中证1000","159629":"中证1000",
+    "159633":"中证1000",
     "159915":"创业板","159952":"创业板","159977":"创业板",
-    "588080":"科创板50","588050":"科创板50",
+    "588080":"科创板50","588050":"科创板50","588000":"科创板50",
+    "563360":"中证A500","512050":"中证A500","563800":"中证A500","563220":"中证A500",
+    "159338":"中证A500","159352":"中证A500","159361":"中证A500","159351":"中证A500",
     "510180":"上证180","510230":"上证180金融",
     "159901":"深证100",
     "515800":"中证800","560050":"MSCI中国A50",
@@ -144,7 +203,9 @@ CAT_INDEX = {
     "上证180金融":  ("1.000018", "sh000018"),
     "深证100":    ("0.399330", "sz399330"),
     "中证800":    ("1.000906", "sh000906"),
-    "MSCI中国A50": ("1.746059", "sh746059"),
+    "中证A500":   ("1.000510", "sh000510"),
+    # MSCI 中国A50 互联互通指数在东财/腾讯均无行情, 用跟踪它的 560050 价格走势代理
+    "MSCI中国A50": ("1.560050", "sh560050"),
 }
 CAL_DAYS = 1850  # 约5年(约1300个工作日) 覆盖全报表5年历史
 
@@ -166,15 +227,16 @@ def natural_dates(n):
         d -= timedelta(days=1)
     return dates
 
-def fetch_kline(dates, secid="1.000985"):
-    """直连东财拉取指数(secid, 默认中证全指000985)日K, 按 dates 对齐返回 [{d,o,h,l,c}|None]. 东财单次限约999条."""
-    if not dates:
-        return []
-    start = dates[0].replace("-", ""); end = dates[-1].replace("-", "")
+KLINE_CACHE = "_kline_cache.json"
+_EM_DOWN = False   # 东财行情接口整体不可达时置真, 后续标的直接走备用源, 避免逐类空转重试
+_TX_DOWN = False   # 腾讯备用源同样整体不可达时置真, 后续直接走K线缓存, 不再逐类重试
+
+def _em_kline(secid, beg, end):
+    """东财单次日K请求. 注意: smplmt 即单次返回条数上限, 设小了长区间会被截断(旧的 smplmt=1000 只能拿999根)."""
     url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get"
            "?fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56"
            "&ut=7eea3edcaed734bea9cbfc24409ed989&klt=101&fqt=0&secid=%s"
-           "&beg=%s&end=%s&smplmt=1000&lmt=200000" % (secid, start, end))
+           "&beg=%s&end=%s&smplmt=10000&lmt=200000" % (secid, beg, end))
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
 
     def _get():
@@ -186,65 +248,151 @@ def fetch_kline(dates, secid="1.000985"):
             raise ValueError("empty klines")
         return ks
 
-    data = retry(_get, tries=5, gap=6)
+    return retry(_get, tries=3, gap=4)
+
+def fetch_kline(dates, secid="1.000985"):
+    """直连东财拉取指数(secid, 默认中证全指000985)日K, 按 dates 对齐返回 [{d,o,h,l,c}|None].
+    按年分片请求后合并, 避免单次请求条数上限导致早段被截断; 部分年份失败时其余年份仍然可用."""
+    if not dates:
+        return []
+    global _EM_DOWN
+    if _EM_DOWN:
+        raise ValueError("东财K线不可达(本轮已跳过)")
     m = {}
-    for line in data:
-        f = line.split(",")
-        k = f[0].replace("-", "")
-        if k.isdigit() and len(k) == 8:
-            # 顺序: 日期,开,收,高,低,...
-            m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
-                    round(float(f[4]), 3), round(float(f[2]), 3)]
+    err = None
+    fails = 0
+    for y in range(int(dates[0][:4]), int(dates[-1][:4]) + 1):
+        try:
+            for line in _em_kline(secid, "%d0101" % y, "%d1231" % y):
+                f = line.split(",")
+                k = f[0].replace("-", "")
+                if k.isdigit() and len(k) == 8:
+                    # 顺序: 日期,开,收,高,低,...
+                    m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
+                            round(float(f[4]), 3), round(float(f[2]), 3)]
+            fails = 0
+        except Exception as e:
+            err = e
+            fails += 1
+            print("  东财K线分片失败 %s %d年: %s" % (secid, y, str(e)[:50]), flush=True)
+            # 开头连续两年都失败(多为网络不可达), 立即放弃东财, 交给备用源, 避免逐片空转重试
+            if fails >= 2 and not m:
+                _EM_DOWN = True
+                raise ValueError("东财K线不可达: %s" % (err,))
     if not m:
-        return [None for _ in dates]
+        raise ValueError("empty klines: %s" % (err,))
     return [({"d": d, "o": m[k][0], "h": m[k][1], "l": m[k][2], "c": m[k][3]}
              if (k := d.replace("-", "")) in m else None) for d in dates]
 
 def fetch_kline_tx(dates, tx_code="sh000985"):
-    """备选源(腾讯) 指数(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量"""
+    """备选源(腾讯) 指数(sh000985)日K, 与 fetch_kline 同返回格式. 行: 日期,开,收,高,低,量
+    同样按年分片, 避免 count 上限截断早段."""
     if not dates:
         return []
+    global _TX_DOWN
+    if _TX_DOWN:
+        raise ValueError("腾讯K线不可达(本轮已跳过)")
+
     def _d8(x):
         s = str(x)
         return f"{s[0:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 and s.isdigit() else s
-    start = _d8(dates[0]); end = _d8(dates[-1])
-    url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-           "?param=%s,day,%s,%s,1600,qfq" % (tx_code, start, end))
+
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
-
-    def _get():
-        j = requests.get(url, headers=headers, timeout=45).json()
-        if not isinstance(j, dict):
-            raise ValueError("bad resp type")
-        d = j.get("data")
-        rows = None
-        if isinstance(d, dict):
-            for sym in (tx_code, "qfqday", "day"):
-                v = d.get(sym)
-                if isinstance(v, dict):
-                    rows = v.get("qfqday") or v.get("day") or v.get("data")
-                elif isinstance(v, list) and v:
-                    rows = v
-                if rows:
-                    break
-        elif isinstance(d, list) and d:
-            rows = d
-        if not rows:
-            raise ValueError("empty tx klines")
-        return rows
-
-    rows = retry(_get, tries=8, gap=8)
     m = {}
-    for f in rows:
+    err = None
+    fails = 0
+    for y in range(int(dates[0][:4]), int(dates[-1][:4]) + 1):
+        url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+               "?param=%s,day,%d-01-01,%d-12-31,800,qfq" % (tx_code, y, y))
+
+        def _get():
+            j = requests.get(url, headers=headers, timeout=45).json()
+            if not isinstance(j, dict):
+                raise ValueError("bad resp type")
+            d = j.get("data")
+            rows = None
+            if isinstance(d, dict):
+                for sym in (tx_code, "qfqday", "day"):
+                    v = d.get(sym)
+                    if isinstance(v, dict):
+                        rows = v.get("qfqday") or v.get("day") or v.get("data")
+                    elif isinstance(v, list) and v:
+                        rows = v
+                    if rows:
+                        break
+            elif isinstance(d, list) and d:
+                rows = d
+            if not rows:
+                raise ValueError("empty tx klines")
+            return rows
+
         try:
-            if len(f) >= 5 and f[0].isdigit() is False and "-" in f[0]:
-                k = f[0].replace("-", "")
-                m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
-                        round(float(f[4]), 3), round(float(f[2]), 3)]
-        except Exception:
-            pass
+            rows = retry(_get, tries=3, gap=6)
+        except Exception as e:
+            err = e
+            fails += 1
+            print("  腾讯K线分片失败 %s %d年: %s" % (tx_code, y, str(e)[:50]), flush=True)
+            # 开头连续两年失败且无任何数据(多为限流/不可达), 后续类别直接走缓存, 避免逐类空转重试
+            if fails >= 2 and not m:
+                _TX_DOWN = True
+                raise ValueError("腾讯K线不可达: %s" % (err,))
+            continue
+        fails = 0
+        for f in rows:
+            try:
+                if len(f) >= 5 and "-" in str(f[0]):
+                    k = str(f[0]).replace("-", "")
+                    m[k] = [round(float(f[1]), 3), round(float(f[3]), 3),
+                            round(float(f[4]), 3), round(float(f[2]), 3)]
+            except Exception:
+                pass
+    if not m:
+        raise ValueError("empty tx klines: %s" % (err,))
     return [({"d": d, "o": m[k][0], "h": m[k][1], "l": m[k][2], "c": m[k][3]}
              if (k := d.replace("-", "")) in m else None) for d in dates]
+
+def load_kline_cache():
+    try:
+        j = json.load(open(KLINE_CACHE, encoding="utf-8-sig"))
+        return j if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+def merge_kline(dates, arr, cmap):
+    """用缓存 cmap(键=YYYYMMDD -> [开,高,低,收]) 补齐 arr 中的 None, 同时把本次有效数据回写 cmap.
+    保证取数偶发失败时图表不出现整段空白."""
+    out, hit = [], 0
+    for d, it in zip(dates, arr or []):
+        k = str(d).replace("-", "")
+        if it:
+            cmap[k] = [it["o"], it["h"], it["l"], it["c"]]
+            out.append(it)
+        elif k in cmap:
+            v = cmap[k]
+            out.append({"d": d, "o": v[0], "h": v[1], "l": v[2], "c": v[3]})
+            hit += 1
+        else:
+            out.append(None)
+    return out, hit
+
+def save_kline_cache(cache, keep_dates):
+    """只保留当前窗口内的 K 线, 防止缓存文件逐年膨胀."""
+    if not isinstance(cache, dict):
+        return
+    keep = set(str(d).replace("-", "") for d in (keep_dates or []))
+    if keep:
+        for sec in ("kline",):
+            if isinstance(cache.get(sec), dict):
+                cache[sec] = {k: v for k, v in cache[sec].items() if k in keep}
+        for name, sub in list((cache.get("cat") or {}).items()):
+            cache["cat"][name] = {k: v for k, v in sub.items() if k in keep}
+    try:
+        tmp = KLINE_CACHE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, KLINE_CACHE)
+    except Exception as e:
+        print("K线缓存写入失败:", str(e)[:80], flush=True)
 
 def load_shares(dates):
     """沪: fund_etf_scale_sse 逐日; 深: fund_scale_daily_szse 区间批量"""
@@ -292,6 +440,23 @@ def load_shares(dates):
             deep_start = sz_have[0]
     return daily_shares, valid, deep_start
 
+def fetch_em_share(code):
+    """东财实时总份额(份): push2 行情接口 f84=基金总份额. 云端可达, 用于上交所份额取数失败时的沪市兜底."""
+    secid = ("1." if code.startswith(("5", "6")) else "0.") + code
+    url = ("https://push2.eastmoney.com/api/qt/stock/get?invt=2&fltt=2"
+           "&fields=f57,f84&secid=" + secid)
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}
+
+    def _get():
+        j = requests.get(url, headers=headers, timeout=20).json()
+        d = j.get("data") or {}
+        v = d.get("f84")
+        if v is None:
+            raise ValueError("no f84")
+        return float(v)
+
+    return retry(_get, tries=3, gap=2)
+
 def load_nav():
     nav = {}
     for code, _, _ in TARGETS:
@@ -309,6 +474,94 @@ def load_nav():
             print(f"  净值 fail {code}: {str(e)[:70]}", flush=True)
     return nav
 
+SH_BACKFILL_FROM = "20251231"   # 沪市新增标的的历史回补起点(含当日, 保证 2025-12-31 基线与近一年口径可用)
+SH_BACKFILL_WORKERS = 8         # 沪市接口按日单取, 并发回补提速(仅新标的一次性回补时启用)
+COVER_MIN = 60                  # 标的在缓存中的交易日覆盖数低于该值, 视为"新增标的"需回补历史
+
+def backfill_new_codes(cache, trade_days=None):
+    """新纳入标的的历史份额一次性回补(仅写入新增标的自身份额, 不膨胀缓存).
+    深市: fund_scale_daily_szse 45天区间批量, 回补全部缓存区间; 沪市: fund_etf_scale_sse 按日并发, 回补 SH_BACKFILL_FROM 之后.
+    完成后写入 cache['hist_done'], 后续运行不再重复回补."""
+    hist = cache.setdefault("shares", {})
+    done = cache.setdefault("hist_done", {})
+    cover = {}
+    for m in hist.values():
+        for c in m:
+            cover[c] = cover.get(c, 0) + 1
+    gap = [c for c, _, _ in TARGETS if not done.get(c) and cover.get(c, 0) < COVER_MIN]
+    if not gap:
+        return 0
+    days = [d for d in sorted(hist) if (not trade_days or d in trade_days)]
+    if not days:
+        return 0
+    mkt = {c: mk for c, _, mk in TARGETS}
+    sh_gap = [c for c in gap if mkt.get(c) == "sh"]
+    sz_gap = [c for c in gap if mkt.get(c) == "sz"]
+    filled = 0
+
+    def _take(df, keep):
+        n = 0
+        if df is None or len(df) == 0:
+            return 0
+        dcol = "日期" if "日期" in df.columns else "统计日期"
+        for _, row in df.iterrows():
+            try:
+                code = str(row.get("基金代码")).zfill(6)
+                v = float(row.get("基金份额"))
+            except Exception:
+                continue
+            dd = str(row.get(dcol))[:10].replace("-", "")
+            if code in keep and len(dd) == 8 and dd.isdigit() and (not trade_days or dd in trade_days):
+                hist.setdefault(dd, {})[code] = v
+                n += 1
+        return n
+
+    if sh_gap:
+        sh_days = [d for d in days if d >= SH_BACKFILL_FROM]
+        keep = set(sh_gap)
+        print("沪市新增标的历史回补: %s 自 %s 起共%d日" %
+              (",".join(sh_gap), sh_days[0] if sh_days else "-", len(sh_days)), flush=True)
+
+        def _one(ds):
+            try:
+                return _take(ak.fund_etf_scale_sse(date=ds), keep)
+            except Exception:
+                return 0
+
+        with ThreadPoolExecutor(max_workers=SH_BACKFILL_WORKERS) as ex:
+            futs = [ex.submit(_one, ds) for ds in sh_days]
+            for i, fu in enumerate(futs, 1):
+                filled += fu.result()
+                if i % 50 == 0 or i == len(futs):
+                    print("  沪市回补进度 %d/%d" % (i, len(futs)), flush=True)
+        for c in sh_gap:
+            n = sum(1 for m in hist.values() if c in m)
+            print("  沪市回补完成 %s: 累计%d个交易日" % (c, n), flush=True)
+            if n >= 5:
+                done[c] = "1"
+
+    if sz_gap:
+        keep = set(sz_gap)
+        CH = 45
+        print("深市新增标的历史回补: %s 共%d个交易日区间" % (",".join(sz_gap), len(days)), flush=True)
+        for i in range(0, len(days), CH):
+            s = days[i]; e = days[min(i + CH - 1, len(days) - 1)]
+            try:
+                sdf = retry(lambda s=s, e=e: ak.fund_scale_daily_szse(
+                    start_date=s, end_date=e, symbol="ETF"), tries=2, gap=3)
+            except Exception as ex:
+                print("  深市回补 fail %s~%s: %s" % (s, e, str(ex)[:50]), flush=True)
+                continue
+            filled += _take(sdf, keep)
+        for c in sz_gap:
+            n = sum(1 for m in hist.values() if c in m)
+            print("  深市回补完成 %s: 累计%d个交易日" % (c, n), flush=True)
+            if n >= 5:
+                done[c] = "1"
+
+    cache["hist_done"] = done
+    return filled
+
 def main():
     print("拉取数据中 ...", flush=True)
     cache = {}
@@ -322,9 +575,14 @@ def main():
     window = incremental_dates(cache, CAL_DAYS)
     print("本次拉取日期窗口: %s ~ %s (共%d个工作日)" %
           (window[0] if window else "-", window[-1] if window else "-", len(window)), flush=True)
-    shares, valid, deep_start = load_shares_cached(window, cache)
+    trade_days = load_trade_calendar(cache)
+    shares, valid, deep_start = load_shares_cached(window, cache, trade_days)
+    # 新增纳入标的(如 2026.10救市口径)无历史缓存: 一次性回补其历史份额, 保证近一月/近一年与 2025-12-31 基线可用
+    if backfill_new_codes(cache, trade_days):
+        shares = cache.get("shares", {})
+        valid = sorted(d for d, m in shares.items() if m)
     # 数据新鲜度自检: 若展示日落后于最近已结束交易日(通常因数据源晚发布/单边失败), 等待后重试抓取
-    exp = expected_latest_cut()
+    exp = expected_latest_cut(trade_days)
     for _attempt in range(FRESH_RETRY):
         cur = sync_day_of(shares, valid)
         stale = cur is not None and int(cur) < exp
@@ -333,7 +591,42 @@ def main():
         if not stale or not window:
             break
         time.sleep(FRESH_WAIT)
-        shares, valid, deep_start = load_shares_cached(window, cache)
+        shares, valid, deep_start = load_shares_cached(window, cache, trade_days)
+    # 沪市最新交易日兜底: 云端/个别环境访问上交所受限(fund_etf_scale_sse 常失败), 若最近已结束交易日缺沪份额,
+    # 用东财实时总份额(f84)补入, 保证沪深同步日能推进到最近交易日; 历史缺口待上交所接口恢复后由增量拉取回补。
+    # 仅当 exp 确为交易日时才兜底, 避免节假日(如国庆/中秋)被误填成"幽灵交易日"在K线图上留空。
+    _sh_live = [c for c, _, _m in TARGETS if _m == "sh"]
+    _exp_s = str(exp)
+    _exp_is_trade = (not trade_days) or (_exp_s in trade_days)
+    if _sh_live and _exp_is_trade and not any(shares.get(_exp_s, {}).get(c) for c in _sh_live):
+        _filled = 0; _stale = 0
+        # 找沪市最近一个有官方份额的日期, 用于识别东财快照是否只是"昨日值"(陈旧快照)
+        _prev_sh = {}
+        for _d in reversed(valid):
+            if _d >= _exp_s:
+                continue
+            _m = shares.get(_d, {})
+            if any(c in _m for c in _sh_live):
+                _prev_sh = _m
+                break
+        for _c in _sh_live:
+            try:
+                _p = fetch_em_share(_c)
+            except Exception:
+                _p = None
+            if not _p:
+                continue
+            _q = _prev_sh.get(_c)
+            if _q and abs(_p - _q) <= max(1.0, _q * 1e-9):
+                _stale += 1   # 与上一交易日份额相同 => 快照未滚动, 注入会伪造沪深同步日, 跳过
+                continue
+            shares.setdefault(_exp_s, {})[_c] = _p
+            _filled += 1
+        if _filled:
+            valid = sorted(set(valid) | {_exp_s})
+            print(f"沪市东财快照兜底: 补入 {_exp_s} 沪市 {_filled} 只份额(陈旧跳过 {_stale})", flush=True)
+        elif _stale:
+            print(f"沪市东财快照仍为上一交易日值(跳过{_stale}只), {_exp_s} 沪市暂缺, 数据日按两市同步日回退", flush=True)
     with open(SHARES_CACHE, "w", encoding="utf-8") as f:
         json.dump(cache, f, ensure_ascii=False)
     if not valid:
@@ -416,7 +709,9 @@ def main():
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     if lpub and lpub.get("day") == today:
         stamp = lpub.get("updated") or stamp
-    # 各类指数K线: 逐类尝试东财secid, 失败退腾讯; 全部失败则该类为 None 列表
+    # 各类指数K线: 逐类尝试东财secid, 失败退腾讯; 仍缺的用历史K线缓存补齐(保证不出现整段空白)
+    _kcache = load_kline_cache()
+    _kcat = _kcache.setdefault("cat", {})
     cat_kline = {}
     for _cat, (_e_sec, _tx) in CAT_INDEX.items():
         try:
@@ -427,6 +722,10 @@ def main():
             except Exception as _e2:
                 print(f"指数K线失败 {_cat}: {_e2}", flush=True)
                 cat_kline[_cat] = [None] * len(dates_sorted)
+        cat_kline[_cat], _hit = merge_kline(dates_sorted, cat_kline[_cat],
+                                            _kcat.setdefault(_cat, {}))
+        if _hit:
+            print(f"  {_cat} K线缓存补齐 {_hit} 日", flush=True)
     payload = {
         "updated": stamp,
         "data_asof": today,
@@ -448,6 +747,12 @@ def main():
         except Exception as e2:
             print("K线拉取失败(报表其余部分不受影响):", e2)
             payload["kline"] = [None] * len(dates_sorted)
+    payload["kline"], _hit = merge_kline(dates_sorted, payload["kline"],
+                                        _kcache.setdefault("kline", {}))
+    _ok = sum(1 for x in payload["kline"] if x)
+    print("中证全指K线: 有效 %d/%d 日%s" % (_ok, len(dates_sorted),
+          (", 缓存补齐%d日" % _hit) if _hit else ""), flush=True)
+    save_kline_cache(_kcache, dates_sorted)
     dsh_all, s5, n5 = {}, {}, {}
     for code, _, _ in TARGETS:
         # 2025-12-31 份额/净值 基准备锚，用于"每日倍量"：单只按份额、同类/全表按金额
@@ -512,6 +817,12 @@ def render_html(p):
         return s
     def cls(v):
         return "pos" if v >= 0 else "neg"
+    def ftag(code):
+        if code in NEW_TAG_CODES:
+            return f'<span class="tag">{NEW_TAG}</span>'
+        if code in BASE23:
+            return f'<span class="tag tagb">{BASE_TAG}</span>'
+        return ''
     dates = p["dates"]
     dt = {}
     for k, v in p["date_total"].items():
@@ -696,16 +1007,24 @@ def render_html(p):
         if m is None:
             return f'<td class="r {c}">{top}</td>'
         return f'<td class="r {c}">{top}<div class="mult {cls(m)}">{m:+.2f}倍</div></td>'
+    # 同一指数的 ETF 放在一起展示: 先按类别近{HOT}日净买入合计排序, 类内再按单只合计排序, 类前插入分组行
+    _hot_sum = lambda e: sum(e["series"].get(d) or 0 for d in hot_dates)
+    _groups = {}
     for e in etfs:
-        ser = e["series"]
-        bz = e.get("s2025", 0) * 0.001 if e.get("s2025", 0) > 0 else None
-        dsh = e.get("dsh", {})
-        cells = ""
-        for d in hot_dates:
-            v = ser.get(d)
-            m = (dsh.get(d) / bz) if (bz and dsh.get(d) is not None) else None
-            cells += _dm_cell(v, m)
-        hot_html += f"<tr><td><span class='mkt'>{e['m']}</span>{escape_html(e['n'])}</td>{cells}</tr>"
+        _groups.setdefault(e.get("cat", "其他"), []).append(e)
+    for _cat in sorted(_groups, key=lambda c: sum(_hot_sum(e) for e in _groups[c]), reverse=True):
+        hot_html += ('<tr class="ghead"><td colspan="%d">%s · %d只</td></tr>'
+                     % (len(hot_dates) + 1, escape_html(_cat), len(_groups[_cat])))
+        for e in sorted(_groups[_cat], key=_hot_sum, reverse=True):
+            ser = e["series"]
+            bz = e.get("s2025", 0) * 0.001 if e.get("s2025", 0) > 0 else None
+            dsh = e.get("dsh", {})
+            cells = ""
+            for d in hot_dates:
+                v = ser.get(d)
+                m = (dsh.get(d) / bz) if (bz and dsh.get(d) is not None) else None
+                cells += _dm_cell(v, m)
+            hot_html += f"<tr><td><span class='mkt'>{e['m']}</span>{escape_html(e['n'])}{ftag(e['c'])}</td>{cells}</tr>"
 
     # 同类指数归集 · 每日净买卖明细矩阵 (最近 HOT 个交易日)
     cat_daily = {}
@@ -739,17 +1058,25 @@ def render_html(p):
         tot_cells += _dm_cell(v, m)
     cat_daily_tot = f'<tr class="ctot"><td><b>全部（{len(cat_daily)}类{len(etfs)}只）</b></td>{tot_cells}</tr>'
 
-    # 表格行
+    # 表格行: 同一指数的 ETF 放在一起, 类别按近一月合计降序, 类内按近一月降序, 类前插入分组行
     rows = ""
+    _sum_groups = {}
     for e in etfs:
-        rows += f"""<tr>
-          <td><span class="mkt">{e['m']}</span>{escape_html(e['n'])}<span class="code">{e['c']}</span></td>
+        _sum_groups.setdefault(e.get("cat", "其他"), []).append(e)
+    _sum_rows = ""
+    for _cat in sorted(_sum_groups, key=lambda c: sum(x["month"] for x in _sum_groups[c]), reverse=True):
+        _sum_rows += ('<tr class="ghead"><td colspan="6">%s · %d只</td></tr>'
+                      % (escape_html(_cat), len(_sum_groups[_cat])))
+        for e in sorted(_sum_groups[_cat], key=lambda x: x["month"], reverse=True):
+            _sum_rows += f"""<tr>
+          <td><span class="mkt">{e['m']}</span>{escape_html(e['n'])}{ftag(e['c'])}<span class="code">{e['c']}</span></td>
           <td class="r">{e['last_share']:,.1f}</td>
           <td class="r {cls(e['today'])}">{fnum(e['today'], True)}</td>
           <td class="r {cls(e['week'])}">{fnum(e['week'], True)}</td>
           <td class="r {cls(e['month'])}">{fnum(e['month'], True)}</td>
           <td class="tbar"><div class="tbf"><i class="{cls(e['month'])}" style="width:{min(abs(e['month'])/50*100,100):.0f}%"></i></div></td>
         </tr>"""
+    rows = _sum_rows
 
     # 柱状图
     bars = ""
@@ -833,12 +1160,16 @@ th:first-child{{text-align:left}}
 td{{padding:7px 8px;border-bottom:1px solid var(--line);font-variant-numeric:tabular-nums}}
 td.r{{text-align:right;white-space:nowrap}}
 tr.ctot td{{border-top:2px solid var(--ink);font-weight:600;background:#fafbfc}}
+tr.ghead td{{background:#eef2fa;color:#2b3a67;font-weight:700;font-size:11px;padding:5px 8px;border-top:1px solid var(--line)}}
 td.zero{{color:var(--mut);font-size:11px;opacity:.65}}
 .mult{{display:block;font-size:10px;opacity:.72;margin-top:1px;font-family:var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
 table.matrix td{{font:11px var(--font-mono,"SFMono-Regular",Consolas,monospace)}}
 table.matrix th{{font-size:10px}}
 .mkt{{display:inline-block;font-size:10px;color:var(--mut);border:1px solid var(--line);border-radius:4px;padding:0 4px;margin-right:6px}}
 .code{{color:var(--mut);font-size:11px;margin-left:6px}}
+.tag{{display:inline-block;font-size:10px;line-height:15px;color:#b45309;background:#fff7ed;
+  border:1px solid #fed7aa;border-radius:4px;padding:0 5px;margin-left:6px;vertical-align:1px;font-weight:500;white-space:nowrap}}
+.tagb{{color:#1d4ed8;background:#eff6ff;border-color:#bfdbfe}}
 .tbar{{width:90px}}.tbf{{background:#f0f1f4;border-radius:3px;height:10px;overflow:hidden}}
 .tbf i{{display:block;height:100%;border-radius:3px}}
 .tbf i.pos{{background:var(--pos)}}.tbf i.neg{{background:var(--neg)}}
@@ -866,10 +1197,10 @@ svg text{{fill:var(--mut);font-size:10px}}
       <h1>国家队ETF · 每日净买入 / 净卖出</h1>
       <div class="sub"><span>数据日 <b>{escape_html(p['data_asof'])}</b></span>
         <span>更新时间 <b>{escape_html(p['updated'])}</b></span>
-        <span>标的口径：中央汇金持仓宽基ETF 共 <b>{len(etfs)}</b> 只</span>
+        <span>标的口径：汇金系相关宽基ETF篮子 共 <b>{len(etfs)}</b> 只 · 全市场净申赎</span>
         <button onclick="location.reload()" title="点击重新加载，并按沪深两市同步日期展示最新数据"
            style="cursor:pointer;margin-left:6px;padding:4px 12px;border:1px solid var(--line,#ccc);border-radius:6px;background:var(--card,#fff);color:var(--txt,#111);font-size:12px">🔄 刷新数据</button></div>
-      <div style="color:var(--mut);font-size:12px;margin-top:6px">汇金 2025 年 12 月 31 日持仓约 1.5 万亿、总计 23 只。本数据无法准确检测汇金实际持仓，仅反映这 23 只 ETF 的每日净申购赎回情况。</div>
+      <div style="color:var(--mut);font-size:12px;margin-top:6px">本表为汇金系相关宽基ETF篮子（{len(etfs)}只，含23只汇金持仓口径与救市专项口径品种）的全市场每日净申赎估算，篮子 ≠ 汇金实际持仓，无法据此准确检测汇金买卖。</div>
     </div>
   </div>
   <div class="kpis">
@@ -895,7 +1226,7 @@ svg text{{fill:var(--mut);font-size:10px}}
   <div class="card"><h2>全部品种 · 每日净买卖合计（近21个交易日，亿元）</h2>
     <div class="bars">{bars}</div>
     <div class="svgwrap"><div class="chartbox">
-      <h2 style="font-size:14px">累计持仓金额 · 最长 {len(y_dates)}个交易日（亿元 · 悬停查看当日）</h2>
+      <h2 style="font-size:14px">累计持仓金额 · 最长 {len(y_dates)}个交易日（亿元）</h2>
       <div id="cumTip" class="cumtip"></div>
       <svg id="cumSvg" viewBox="0 0 {W} {H}" width="100%" height="{H}" preserveAspectRatio="none">
         <line id="cumGuide" x1="-10" y1="{pad}" x2="-10" y2="{H-pad}" stroke="#c0c6d4" stroke-width="1" stroke-dasharray="3 3"/>
@@ -908,7 +1239,7 @@ svg text{{fill:var(--mut);font-size:10px}}
     </div></div>
     {JS_CODE}
   </div>
-  <div class="card"><h2>指数K线 × 每日净买入联动（上K线 下当日净买卖 · 悬停查看）</h2>
+  <div class="card"><h2>指数K线 × 每日净买入联动（上K线 下当日净买卖）</h2>
     <div class="klnctl"><span class="kp">指数</span>
       <select id="klnCat" style="font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--fg)">{_cat_opts}</select>
       <span class="kp" style="margin-left:10px">显示范围</span>
@@ -918,13 +1249,14 @@ svg text{{fill:var(--mut);font-size:10px}}
       <button class="rng" data-n="0">全部</button>
       <span class="kpt" id="klnDate"></span></div>
     <div id="klnBox" style="height:520px;width:100%"></div>
-    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至11类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元），鼠标悬停联动查看；红=净买入、绿=净卖出。</div>
+    <div id="klnTip" class="ktip">默认显示中证全指K线与全市场国家队ETF每日净买入联动；下拉可切换至{len(CAT_INDEX)}类细分指数（沪深300、创业板等）K线 × 该类ETF净买入合计。上方为指数日K线，下方为当日净买入金额（亿元）；红=净买入、绿=净卖出。</div>
   </div>
   <div class="card"><h2>分品种汇总 · 近一周 / 近一月净买入卖出（亿元，按近一月降序）</h2>
     <div style="overflow-x:auto"><table>
       <thead><tr><th>品种</th><th>最新份额(亿)</th><th>今日</th><th>近一周</th><th>近一月</th><th style="width:90px">近一月强度</th></tr></thead>
       <tbody>{rows}</tbody>
     </table></div>
+    <div style="color:var(--mut);font-size:11px;margin-top:8px">标注「{BASE_TAG}」的 {len(BASE23)} 只为基础口径（2025 年报披露的汇金系持仓宽基ETF）；标注「{NEW_TAG}」的 {len(NEW_TAG_CODES)} 只为 2026 年 10 月救市名单中新增纳入、此前报表未跟踪的品种。</div>
   </div>
   <div class="card"><h2>同类指数品种归集汇总（亿元）</h2>
     <div style="overflow-x:auto"><table>
