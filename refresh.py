@@ -302,29 +302,40 @@ def fetch_kline_tx(dates, tx_code="sh000985"):
     err = None
     fails = 0
     for y in range(int(dates[0][:4]), int(dates[-1][:4]) + 1):
-        url = ("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-               "?param=%s,day,%d-01-01,%d-12-31,800,qfq" % (tx_code, y, y))
+        # 两个腾讯端点: fqkline(前复权) 失效时退 kline(不复权), 避免单点故障造成整段缺口
+        urls = [("https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                 "?param=%s,day,%d-01-01,%d-12-31,800,qfq" % (tx_code, y, y)),
+                ("https://web.ifzq.gtimg.cn/appstock/app/kline/kline"
+                 "?param=%s,day,%d-01-01,%d-12-31,800" % (tx_code, y, y))]
 
         def _get():
-            j = requests.get(url, headers=headers, timeout=45).json()
-            if not isinstance(j, dict):
-                raise ValueError("bad resp type")
-            d = j.get("data")
-            rows = None
-            if isinstance(d, dict):
-                for sym in (tx_code, "qfqday", "day"):
-                    v = d.get(sym)
-                    if isinstance(v, dict):
-                        rows = v.get("qfqday") or v.get("day") or v.get("data")
-                    elif isinstance(v, list) and v:
-                        rows = v
-                    if rows:
-                        break
-            elif isinstance(d, list) and d:
-                rows = d
-            if not rows:
-                raise ValueError("empty tx klines")
-            return rows
+            last = None
+            for url in urls:
+                try:
+                    j = requests.get(url, headers=headers, timeout=45).json()
+                except Exception as e:
+                    last = e
+                    continue
+                if not isinstance(j, dict):
+                    last = ValueError("bad resp type")
+                    continue
+                d = j.get("data")
+                rows = None
+                if isinstance(d, dict):
+                    for sym in (tx_code, "qfqday", "day"):
+                        v = d.get(sym)
+                        if isinstance(v, dict):
+                            rows = v.get("qfqday") or v.get("day") or v.get("data")
+                        elif isinstance(v, list) and v:
+                            rows = v
+                        if rows:
+                            break
+                elif isinstance(d, list) and d:
+                    rows = d
+                if rows:
+                    return rows
+                last = ValueError("empty tx klines")
+            raise last or ValueError("empty tx klines")
 
         try:
             rows = retry(_get, tries=3, gap=6)
@@ -374,6 +385,61 @@ def merge_kline(dates, arr, cmap):
         else:
             out.append(None)
     return out, hit
+
+def fill_kline_gaps(dates, arr, cmap, secid, tx_code, label):
+    """缺日自愈: 对合并缓存后仍缺失的日期(多为取数故障留下的新断点)重试 东财/腾讯/新浪 补齐.
+    只补首个有效值之后的日期(指数上市前的空白本无数据); 已有值的日期绝不覆盖, 避免混入不同复权口径.
+    每日CI运行本脚本时自动清除断点, 无需人工干预. 返回补上的天数."""
+    have = [str(d) for d, x in zip(dates, arr) if x]
+    if not have:
+        return 0
+    first = min(have)
+    miss = [(i, str(dates[i])) for i, x in enumerate(arr) if not x and str(dates[i]) >= first]
+    filled = 0
+
+    def _apply(rest, res, src):
+        nonlocal filled
+        n = 0
+        for (i, k), r in zip(rest, res):
+            if r and not arr[i]:
+                arr[i] = r
+                cmap[k] = [r["o"], r["h"], r["l"], r["c"]]
+                n += 1
+        if n:
+            filled += n
+            print("  %s 缺日自愈(%s): 补%d日" % (label, src, n), flush=True)
+
+    for fn, src in ((lambda d: fetch_kline(d, secid), "东财"),
+                    (lambda d: fetch_kline_tx(d, tx_code), "腾讯")):
+        rest = [(i, k) for i, k in miss if not arr[i]]
+        if not rest:
+            break
+        try:
+            _apply(rest, fn([dates[i] for i, _ in rest]), src)
+        except Exception as e:
+            print("  %s 缺日自愈(%s)未成功: %s" % (label, src, str(e)[:60]), flush=True)
+    rest = [(i, k) for i, k in miss if not arr[i]]
+    if rest:
+        try:
+            sdf = ak.stock_zh_index_daily(symbol=tx_code)
+            smap = {}
+            for _, rw in sdf.iterrows():
+                kk = str(rw["date"])[:10].replace("-", "")
+                smap[kk] = [round(float(rw["open"]), 3), round(float(rw["high"]), 3),
+                            round(float(rw["low"]), 3), round(float(rw["close"]), 3)]
+            n = 0
+            for i, k in rest:
+                if k in smap and not arr[i]:
+                    o, h, l, c = smap[k]
+                    arr[i] = {"d": dates[i], "o": o, "h": h, "l": l, "c": c}
+                    cmap[k] = [o, h, l, c]
+                    n += 1
+            if n:
+                filled += n
+                print("  %s 缺日自愈(新浪): 补%d日" % (label, n), flush=True)
+        except Exception as e:
+            print("  %s 缺日自愈(新浪)未成功: %s" % (label, str(e)[:60]), flush=True)
+    return filled
 
 def save_kline_cache(cache, keep_dates):
     """只保留当前窗口内的 K 线, 防止缓存文件逐年膨胀."""
@@ -726,6 +792,7 @@ def main():
                                             _kcat.setdefault(_cat, {}))
         if _hit:
             print(f"  {_cat} K线缓存补齐 {_hit} 日", flush=True)
+        fill_kline_gaps(dates_sorted, cat_kline[_cat], _kcat[_cat], _e_sec, _tx, _cat)
     payload = {
         "updated": stamp,
         "data_asof": today,
@@ -749,6 +816,8 @@ def main():
             payload["kline"] = [None] * len(dates_sorted)
     payload["kline"], _hit = merge_kline(dates_sorted, payload["kline"],
                                         _kcache.setdefault("kline", {}))
+    fill_kline_gaps(dates_sorted, payload["kline"], _kcache["kline"],
+                    "1.000985", "sh000985", "中证全指")
     _ok = sum(1 for x in payload["kline"] if x)
     print("中证全指K线: 有效 %d/%d 日%s" % (_ok, len(dates_sorted),
           (", 缓存补齐%d日" % _hit) if _hit else ""), flush=True)
