@@ -17,7 +17,7 @@ SHARES_CACHE = os.path.join(OUT_DIR, "_broad_shares_cache.json")
 NAV_CACHE = os.path.join(OUT_DIR, "_broad_nav_cache.json")
 SITE_COPY = os.path.join(OUT_DIR, "broad.html")
 
-HIST_DAYS = 60           # 展示窗口交易日数(缓存会逐日累积, 历史自动变长)
+HIST_DAYS = 250          # 展示窗口交易日数(缓存会逐日累积, 历史自动变长)
 SH = "sh"
 SZ = "sz"
 
