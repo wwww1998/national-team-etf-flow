@@ -24,12 +24,25 @@ def gen_cal_days(start_d, end_d):
     return out
 
 def incremental_dates(cache, cal_days):
-    """增量窗口: 首次构建拉近一年; 有缓存只补拉最近12天(历史由缓存累积)"""
+    """增量窗口: 首次构建拉满 cal_days; 有缓存但历史不足 cal_days 时从窗口起点补齐(补齐一次后即完整),
+    之后每次只补拉最近12天(历史由缓存累积)"""
     hist = (cache or {}).get("shares", {})
     today = datetime.now()
     if not hist:
         return natural_dates(cal_days)
-    return gen_cal_days(today - timedelta(days=12), today)
+    try:
+        lastc = datetime.strptime(max(hist), "%Y%m%d")
+        firstc = datetime.strptime(min(hist), "%Y%m%d")
+    except Exception:
+        return natural_dates(cal_days)
+    five_years = today - timedelta(days=cal_days)
+    start = lastc + timedelta(days=1)
+    if firstc > five_years:
+        start = five_years
+    refresh = today - timedelta(days=12)
+    if start > refresh:
+        start = refresh
+    return gen_cal_days(start, today)
 
 FRESH_RETRY = 2          # 数据滞后时最多重试次数
 FRESH_WAIT = 150         # 每次重试间隔秒数
@@ -338,9 +351,9 @@ CAT_INDEX = {
     "创业板": ("0.399006", "sz399006"),
     "科创板50": ("1.000688", "sh000688"),
     "中证A500": ("1.000510", "sh000510"),
-    "中证2000": ("1.563300", "sh563300"),
+    "中证2000":   ("2.932000", "sh932000"),
 }
-CAL_DAYS = 280  # 约5年(约1300个工作日) 覆盖全报表5年历史
+CAL_DAYS = 1850  # 约5年(约1270个工作日) 覆盖完整历史, 与首页口径一致
 
 def retry(fn, tries=3, gap=2):
     last = None
@@ -523,11 +536,13 @@ def fill_kline_gaps(dates, arr, cmap, secid, tx_code, label):
     """缺日自愈: 对合并缓存后仍缺失的日期(多为取数故障留下的新断点)重试 东财/腾讯/新浪 补齐.
     只补首个有效值之后的日期(指数上市前的空白本无数据); 已有值的日期绝不覆盖, 避免混入不同复权口径.
     每日CI运行本脚本时自动清除断点, 无需人工干预. 返回补上的天数."""
+    global _EM_DOWN, _TX_DOWN
+    _EM_DOWN = False      # 自愈阶段重新给两个源各一次机会(主循环可能因个别指数失败而熔断)
+    _TX_DOWN = False
     have = [str(d) for d, x in zip(dates, arr) if x]
     if not have:
         return 0
-    first = min(have)
-    miss = [(i, str(dates[i])) for i, x in enumerate(arr) if not x and str(dates[i]) >= first]
+    miss = [(i, str(dates[i])) for i, x in enumerate(arr) if not x]
     filled = 0
 
     def _apply(rest, res, src):
