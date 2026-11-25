@@ -50,6 +50,7 @@ jobs:
           [ -f _kline_cache.json ] && git add _kline_cache.json
           [ -f "全市场宽基指数基金统计.html" ] && git add "全市场宽基指数基金统计.html" broad.html
           [ -f _broad_shares_cache.json ] && git add _broad_shares_cache.json
+          [ -f _broad_kline_cache.json ] && git add _broad_kline_cache.json
           [ -f _broad_nav_cache.json ] && git add _broad_nav_cache.json
           if git diff --cached --quiet; then
             echo "报表无变化, 跳过提交"
