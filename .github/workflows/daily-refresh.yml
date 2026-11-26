@@ -36,10 +36,12 @@ jobs:
         run: pip install akshare pandas requests
 
       - name: 运行刷新脚本(拉份额/净值/K线, 计算净买卖, 生成报表)
-        run: python refresh.py
+        run: |
+          python refresh.py || (echo "::warning::首次刷新失败, 60s后重试"; sleep 60; python refresh.py)
 
       - name: 刷新全市场宽基指数基金统计
-        run: python refresh_broad.py
+        run: |
+          python refresh_broad.py || (echo "::warning::宽基首次刷新失败, 60s后重试"; sleep 60; python refresh_broad.py)
 
       - name: 将生成报表复制为 index.html 并提交(含份额/ K线缓存回写)
         run: |

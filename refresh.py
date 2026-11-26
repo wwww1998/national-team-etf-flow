@@ -388,13 +388,15 @@ def merge_kline(dates, arr, cmap):
 
 def fill_kline_gaps(dates, arr, cmap, secid, tx_code, label):
     """缺日自愈: 对合并缓存后仍缺失的日期(多为取数故障留下的新断点)重试 东财/腾讯/新浪 补齐.
-    只补首个有效值之后的日期(指数上市前的空白本无数据); 已有值的日期绝不覆盖, 避免混入不同复权口径.
+    覆盖全窗口(上市前的日期源里本无数据, 自然补不上); 已有值的日期绝不覆盖, 避免混入不同复权口径.
     每日CI运行本脚本时自动清除断点, 无需人工干预. 返回补上的天数."""
+    global _EM_DOWN, _TX_DOWN
+    _EM_DOWN = False      # 自愈阶段重新给两个源各一次机会(主循环可能因个别指数失败而熔断)
+    _TX_DOWN = False
     have = [str(d) for d, x in zip(dates, arr) if x]
     if not have:
         return 0
-    first = min(have)
-    miss = [(i, str(dates[i])) for i, x in enumerate(arr) if not x and str(dates[i]) >= first]
+    miss = [(i, str(dates[i])) for i, x in enumerate(arr) if not x]
     filled = 0
 
     def _apply(rest, res, src):

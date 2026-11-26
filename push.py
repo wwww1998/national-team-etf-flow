@@ -16,9 +16,10 @@ SKIP = 50 * 1024 * 1024      # 单文件 >50MB 不上传(API blob 限制)
 
 
 def git(*args, check=False):
-    r = subprocess.run(["git"] + list(args), cwd=BASE, text=True, capture_output=True)
+    r = subprocess.run(["git"] + list(args), cwd=BASE, capture_output=True,
+                       encoding="utf-8", errors="replace")
     if check and r.returncode:
-        raise SystemExit("git %s 失败: %s" % (" ".join(args), r.stderr.strip()[:200]))
+        raise SystemExit("git %s 失败: %s" % (" ".join(args), (r.stderr or "").strip()[:200]))
     return r
 
 
@@ -78,8 +79,8 @@ def api_push(files, msg):
 def main():
     files = sys.argv[1:]
     if not files:
-        d = git("diff", "--name-only", "origin/" + BRANCH + "...HEAD")
-        files = [x for x in d.stdout.splitlines() if x.strip()]
+        d = git("-c", "core.quotepath=false", "diff", "--name-only", "-z", "origin/" + BRANCH + "...HEAD")
+        files = [x for x in d.stdout.split("\0") if x.strip()]
     msg = git("log", "-1", "--pretty=%s").stdout.strip() or "chore: 自动更新"
     print("尝试 git push ...", flush=True)
     r = git("push", "origin", BRANCH)
